@@ -185,8 +185,11 @@ async def archive_push(request: Request,
 @app.get("/archive/file/{source}/{fname}")
 async def archive_file(source: str, fname: str,
                        x_archive_key: str | None = Header(default=None)):
-    get_source(x_archive_key)
+    s = get_source(x_archive_key)
+    if source != s.get("name"):
+        raise HTTPException(403, "source mismatch")
     fname = Path(fname).name
+    source = Path(source).name
     target = DATA_DIR / source / fname
     if not target.is_file():
         raise HTTPException(404, "not archived")
@@ -196,7 +199,10 @@ async def archive_file(source: str, fname: str,
 @app.get("/archive/list/{source}")
 async def archive_list(source: str,
                        x_archive_key: str | None = Header(default=None)):
-    get_source(x_archive_key)
+    s = get_source(x_archive_key)
+    if source != s.get("name"):
+        raise HTTPException(403, "source mismatch")
+    source = Path(source).name
     conn = db()
     rows = conn.execute(
         "SELECT fname,sha256,size,mtime,task_id,pushed_at FROM archive_files "

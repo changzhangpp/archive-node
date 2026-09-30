@@ -20,7 +20,9 @@ config.json：listen_port / admin_key / sources[{name,key,quota_mb}]（quota_mb=
 首次启动自动生成含随机 admin_key 的 config.json 并在日志打印。
 """
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -30,7 +32,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 BASE = Path(__file__).resolve().parent
@@ -38,7 +40,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930c"
+VERSION = "20260930d"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -101,6 +103,35 @@ def source_dir(source: str) -> Path:
     d = DATA_DIR / source
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def audit_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        actor_type TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT NOT NULL,
+        detail TEXT DEFAULT '')""")
+    return conn
+
+
+def audit(actor_type: str, actor: str, action: str, target: str, detail: str = ""):
+    """写操作审计日志（失败不影响业务）；每次写入顺带清理超过保留期的旧记录。"""
+    try:
+        days = int(load_config().get("audit_retention_days", 30) or 30)
+        now = int(time.time())
+        conn = audit_db()
+        conn.execute(
+            "INSERT INTO audit_log(ts,actor_type,actor,action,target,detail) VALUES(?,?,?,?,?,?)",
+            (now, actor_type, actor, action, target, detail))
+        conn.execute("DELETE FROM audit_log WHERE ts < ?", (now - days * 86400,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def source_usage(source: str) -> int:
@@ -182,6 +213,8 @@ async def archive_push(request: Request,
     conn.close()
     if mtime:
         os.utime(target, (mtime, mtime))
+    audit("source", source, "overwrite" if dedup else "push", fname,
+          f"size={n}; sha256={digest[:16]}")
     return {"ok": True, "dedup": dedup, "fname": fname, "sha256": digest,
             "usage_bytes": source_usage(source)}
 
@@ -327,6 +360,8 @@ async def archive_push_commit(fname: str, upload_id: str, size: int, sha256: str
     conn.close()
     if mtime:
         os.utime(target, (mtime, mtime))
+    audit("source", source, "overwrite" if dedup else "push", fname,
+          f"size={size}; sha256={sha256[:16]}; chunks={len(parts)}")
     print(f"[archive-node] 分片归档 {source}/{fname} ({size}B, {len(parts)}片, dedup={dedup})",
           flush=True)
     return {"ok": True, "dedup": dedup, "fname": fname, "sha256": sha256,
@@ -344,6 +379,7 @@ async def archive_file(source: str, fname: str,
     target = DATA_DIR / source / fname
     if not target.is_file():
         raise HTTPException(404, "not archived")
+    audit("source", s.get("name", ""), "fetch", f"{source}/{fname}")
     return FileResponse(target, filename=fname)
 
 
@@ -441,6 +477,7 @@ async def admin_file_dl(source: str, fname: str,
     target = DATA_DIR / Path(source).name / Path(fname).name
     if not target.is_file():
         raise HTTPException(404, "not found")
+    audit("admin", "admin", "download", f"{source}/{fname}")
     return FileResponse(target, filename=target.name)
 
 
@@ -461,6 +498,7 @@ async def admin_file_delete(source: str, fname: str,
     """删除单个归档文件（磁盘+清单）。注意：来源机回源将 404。"""
     admin_auth(x_admin_key)
     existed = await _delete_one(source, fname)
+    audit("admin", "admin", "delete", f"{source}/{fname}", f"existed={existed}")
     return {"ok": True, "existed": existed}
 
 
@@ -484,6 +522,7 @@ async def admin_source_clear(source: str,
     conn.execute("DELETE FROM archive_files WHERE source=?", (source,))
     conn.commit()
     conn.close()
+    audit("admin", "admin", "clear", source, f"deleted={n}")
     return {"ok": True, "deleted": n}
 
 
@@ -521,7 +560,89 @@ async def admin_sources_save(request: Request,
     if nk:
         cfg["admin_key"] = nk
     save_config(cfg)
+    audit("admin", "admin", "sources_save", "",
+          f"count={len(sources)}" + ("; admin_key_changed" if nk else ""))
     return {"ok": True, "count": len(sources)}
+
+
+# -------------------- 操作审计日志（查询/导出/清空） --------------------
+
+AUDIT_ACTIONS = ("push", "overwrite", "fetch", "download", "delete", "clear",
+                 "upload", "save", "mkdir", "touch", "rename", "move", "copy",
+                 "unarchive", "kill", "sources_save", "audit_clear")
+
+
+def _audit_where(actor: str, action: str, q: str):
+    where, args = [], []
+    if actor:
+        where.append("actor=?")
+        args.append(actor)
+    if action:
+        where.append("action=?")
+        args.append(action)
+    if q:
+        where.append("(target LIKE ? OR detail LIKE ? OR actor LIKE ?)")
+        args += [f"%{q}%"] * 3
+    return (" WHERE " + " AND ".join(where)) if where else "", args
+
+
+@app.get("/admin/api/audit")
+async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
+                      action: str = "", q: str = "",
+                      x_admin_key: str | None = Header(default=None)):
+    """查询操作审计日志（倒序分页，支持 actor/action/关键词过滤）。"""
+    admin_auth(x_admin_key)
+    page = max(1, page)
+    page_size = min(max(10, page_size), 200)
+    w, args = _audit_where(actor, action, q)
+    days = int(load_config().get("audit_retention_days", 30) or 30)
+    conn = audit_db()
+    total = conn.execute("SELECT count(*) FROM audit_log" + w, args).fetchone()[0]
+    rows = conn.execute(
+        "SELECT ts,actor_type,actor,action,target,detail FROM audit_log" + w +
+        " ORDER BY id DESC LIMIT ? OFFSET ?",
+        args + [page_size, (page - 1) * page_size]).fetchall()
+    conn.close()
+    return {"ok": True, "retention_days": days, "total": total, "page": page,
+            "page_size": page_size,
+            "logs": [{"ts": r[0], "actor_type": r[1], "actor": r[2],
+                      "action": r[3], "target": r[4], "detail": r[5]}
+                     for r in rows]}
+
+
+@app.get("/admin/api/audit/export")
+async def admin_audit_export(actor: str = "", action: str = "", q: str = "",
+                             x_admin_key: str | None = Header(default=None)):
+    """按当前过滤条件导出审计日志 CSV。"""
+    admin_auth(x_admin_key)
+    w, args = _audit_where(actor, action, q)
+    conn = audit_db()
+    rows = conn.execute(
+        "SELECT ts,actor_type,actor,action,target,detail FROM audit_log" + w +
+        " ORDER BY id DESC", args).fetchall()
+    conn.close()
+    buf = io.StringIO()
+    wtr = csv.writer(buf)
+    wtr.writerow(["time", "actor_type", "actor", "action", "target", "detail"])
+    for r in rows:
+        wtr.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r[0])),
+                      r[1], r[2], r[3], r[4], r[5]])
+    return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":
+                             "attachment; filename=audit-log.csv"})
+
+
+@app.post("/admin/api/audit/clear")
+async def admin_audit_clear(x_admin_key: str | None = Header(default=None)):
+    """清空审计日志（清空动作本身会补记一条留痕）。"""
+    admin_auth(x_admin_key)
+    conn = audit_db()
+    n = conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
+    conn.execute("DELETE FROM audit_log")
+    conn.commit()
+    conn.close()
+    audit("admin", "admin", "audit_clear", "", f"cleared={n}")
+    return {"ok": True, "cleared": n}
 
 
 # ==================== 管理页面 ====================
@@ -595,6 +716,7 @@ th,td{padding:5px 5px}.hide-m{display:none}}
     <button class="navbtn active" data-view="overview" onclick="showView('overview')">资源管理</button>
     <button class="navbtn" data-view="files" onclick="showView('files')">文件管理</button>
     <button class="navbtn" data-view="sources" onclick="showView('sources')">来源机配置</button>
+    <button class="navbtn" data-view="audit" onclick="showView('audit')">操作日志</button>
   </div>
 
   <div class="view active" id="view-overview">
@@ -618,6 +740,32 @@ th,td{padding:5px 5px}.hide-m{display:none}}
       <span id="fileMsg" class="msg tiny"></span></div>
     <div id="fileBox"></div>
     <div class="pager" id="pager"></div></div>
+  </div>
+
+  <div class="view" id="view-audit">
+  <div class="card"><h2>操作日志 <span class="tiny">（保留 <span id="audDays">30</span> 天，按 key 来源记录）</span></h2>
+    <div class="row">
+      <select id="audActor" onchange="loadAudit(1)"><option value="">全部操作者</option></select>
+      <select id="audAction" onchange="loadAudit(1)">
+        <option value="">全部动作</option>
+        <option value="push">归档新增(push)</option><option value="overwrite">覆盖归档(overwrite)</option>
+        <option value="fetch">回源拉取(fetch)</option><option value="download">下载(download)</option>
+        <option value="delete">删除(delete)</option><option value="clear">清空(clear)</option>
+        <option value="upload">上传(upload)</option><option value="save">编辑保存(save)</option>
+        <option value="mkdir">新建目录(mkdir)</option><option value="touch">新建文件(touch)</option>
+        <option value="rename">重命名(rename)</option><option value="move">移动(move)</option>
+        <option value="copy">复制(copy)</option><option value="unarchive">解压(unarchive)</option>
+        <option value="kill">终止进程(kill)</option><option value="sources_save">来源机配置修改</option>
+        <option value="audit_clear">清空日志</option>
+      </select>
+      <input id="audQ" style="flex:1;min-width:140px" placeholder="关键词（对象/详情/操作者）">
+      <button class="btn btn-p" onclick="loadAudit(1)">查询</button>
+      <button class="btn" onclick="q('#audQ').value='';q('#audActor').value='';q('#audAction').value='';loadAudit(1)">重置</button>
+      <a class="btn" style="text-decoration:none" id="audExport" href="/admin/api/audit/export" download>导出 CSV</a>
+      <button class="btn btn-danger" onclick="clearAudit()">清空日志</button>
+    </div>
+    <div id="audBox"></div>
+    <div class="pager" id="audPager"></div></div>
   </div>
 </div>
 <script>
@@ -673,6 +821,8 @@ async function loadSources(){
     :'<div class="tiny" style="margin-bottom:8px">尚未登记来源机</div>';
   const opts=SRC.map(s=>`<option>${esc(s.name)}</option>`).join('');
   q('#srcSel').innerHTML=opts||'<option value="">（无来源机）</option>';
+  q('#audActor').innerHTML='<option value="">全部操作者</option><option value="admin">admin（管理台）</option>'
+    +SRC.map(s=>`<option>${esc(s.name)}</option>`).join('');
   q('#akInput').placeholder='修改 admin_key';
 }
 function addSrc(){const div=document.createElement('div');div.className='row src-row';
@@ -722,8 +872,38 @@ function showView(name){
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+name));
   document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
   if(name==='files')loadFiles(curPage).catch(()=>{});
+  if(name==='audit')loadAudit(audPage).catch(()=>{});
+}
+const AUD_ACT={push:'归档新增',overwrite:'覆盖归档',fetch:'回源拉取',download:'下载',delete:'删除文件',
+  clear:'清空来源机',upload:'上传文件',save:'编辑保存',mkdir:'新建目录',touch:'新建文件',rename:'重命名',
+  move:'移动',copy:'复制',unarchive:'解压',kill:'终止进程',sources_save:'来源机配置修改',audit_clear:'清空日志'};
+let audPage=1;
+function audQs(extra){const a=encodeURIComponent(q('#audActor').value),ac=encodeURIComponent(q('#audAction').value),
+  kw=encodeURIComponent(q('#audQ').value.trim());return `${extra?'page='+audPage+'&':''}actor=${a}&action=${ac}&q=${kw}`;}
+async function loadAudit(p){
+  audPage=p||audPage||1;
+  q('#audExport').href='/admin/api/audit/export?'+audQs(false);
+  const r=await api('/admin/api/audit?'+audQs(true));
+  q('#audDays').textContent=r.retention_days??30;
+  const pages=Math.max(1,Math.ceil(r.total/r.page_size));
+  q('#audBox').innerHTML=`<table><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
+    ${r.logs.map(x=>`<tr><td class="hide-m">${fmtT(x.ts)}</td>
+      <td><b>${esc(x.actor)}</b><span class="tiny"> ${x.actor_type==='admin'?'（管理台）':'（来源机）'}</span></td>
+      <td>${AUD_ACT[x.action]||esc(x.action)}</td>
+      <td class="mono">${esc(x.target)||'—'}</td>
+      <td class="tiny hide-m">${esc(x.detail)||'—'}</td></tr>`).join('')
+    ||'<tr><td colspan="5" class="tiny">暂无日志</td></tr>'}</table>`;
+  q('#audPager').innerHTML=`<span class="tiny">共 ${r.total} 条 · 第 ${r.page}/${pages} 页</span>
+    ${r.page>1?`<button class="btn" onclick="loadAudit(${r.page-1})">上一页</button>`:''}
+    ${r.page<pages?`<button class="btn" onclick="loadAudit(${r.page+1})">下一页</button>`:''}`;
+}
+async function clearAudit(){
+  if(!confirm('确认清空全部操作日志？（本条清空动作本身会留痕）'))return;
+  await api('/admin/api/audit/clear',{method:'POST'});
+  loadAudit(1);
 }
 function boot(){loadOverview().catch(()=>{});loadSources().then(()=>loadFiles(1)).catch(()=>{});}
+q('#audQ').addEventListener('keydown',e=>{if(e.key==='Enter')loadAudit(1);});
 if(AK){api('/admin/api/overview').then(()=>boot()).catch(()=>{});
   q('#akInput').addEventListener('change',saveKey);}
 else q('#loginMask').style.display='flex';

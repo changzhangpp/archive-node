@@ -27,6 +27,7 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 | 资源管理 | 磁盘总量/剩余、归档总量、各来源机占用与配额使用条、最近推送时间 |
 | 文件管理 | 按来源机浏览（分页）、下载、删除单个、清空某来源机（删除有确认） |
 | 来源机关联配置 | 增删改来源机（名称/key/配额），保存写回 config.json 立即生效；可改 admin_key |
+| 操作日志 | 按 key 来源记录文件级操作（新增/覆盖/回源拉取/下载/删除/清空/上传/编辑/重命名/移动/复制/解压/终止进程/配置修改），保留期 config.json `audit_retention_days`（默认 30 天），支持按操作者/动作/关键词筛选、分页、导出 CSV、一键清空（清空动作本身留痕） |
 
 ## 与来源机对接
 
@@ -51,3 +52,4 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 - 每来源机独立配额（quota_mb），超限拒绝（507）
 - 清单记 SQLite（archive.db），文件落 `data/{来源机名}/`
 - 管理台删除功能（单文件/清空来源机）带确认；删除后来源机回源失效
+- 操作审计：写操作按操作者（来源机 key / admin）留痕入 archive.db `audit_log` 表，读操作（列表/浏览）不留痕避免噪音；审计写入失败不影响业务

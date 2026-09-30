@@ -88,6 +88,15 @@ def _admin_auth(request: Request):
         raise HTTPException(401, "管理密钥错误")
 
 
+def _audit(action: str, target: str, detail: str = ""):
+    """服务器文件操作写入归档机审计日志（失败不影响业务）。"""
+    try:
+        from server import audit
+        audit("admin", "admin", action, target, detail)
+    except Exception:
+        pass
+
+
 def _abs(p: str) -> str:
     if not p or not p.strip():
         raise HTTPException(400, "路径为空")
@@ -171,6 +180,7 @@ async def api_save(request: Request, body: SaveBody):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, p)
+    _audit("save", p, f"encoding={body.encoding}; size={os.path.getsize(p)}")
     return {"ok": True, "path": p, "size": os.path.getsize(p)}
 
 
@@ -181,6 +191,7 @@ async def api_mkdir(request: Request, body: PathBody):
     if os.path.exists(p):
         _fail("已存在")
     os.makedirs(p)
+    _audit("mkdir", p)
     return {"ok": True, "path": p}
 
 
@@ -191,6 +202,7 @@ async def api_touch(request: Request, body: PathBody):
     if os.path.exists(p):
         _fail("已存在")
     Path(p).touch()
+    _audit("touch", p)
     return {"ok": True, "path": p}
 
 
@@ -213,6 +225,8 @@ async def api_delete(request: Request, body: DeleteBody):
             done.append(p)
         except Exception as e:
             errors.append({"path": raw, "error": str(e)})
+    _audit("delete", "; ".join(done)[:500],
+           f"deleted={len(done)}; failed={len(errors)}")
     return {"ok": len(errors) == 0, "deleted": done, "errors": errors}
 
 
@@ -228,6 +242,7 @@ async def api_rename(request: Request, body: RenameBody):
     if os.path.exists(np):
         _fail("目标已存在")
     os.rename(p, np)
+    _audit("rename", f"{p} -> {np}")
     return {"ok": True, "path": np}
 
 
@@ -264,6 +279,8 @@ async def api_copy(request: Request, body: TransferBody):
             done.append(target)
         except Exception as e:
             errors.append({"path": raw, "error": str(e)})
+    _audit("copy", "; ".join(done)[:500],
+           f"dest={dest}; copied={len(done)}; failed={len(errors)}")
     return {"ok": len(errors) == 0, "copied": done, "errors": errors}
 
 
@@ -286,6 +303,8 @@ async def api_move(request: Request, body: TransferBody):
             done.append(target)
         except Exception as e:
             errors.append({"path": raw, "error": str(e)})
+    _audit("move", "; ".join(done)[:500],
+           f"dest={dest}; moved={len(done)}; failed={len(errors)}")
     return {"ok": len(errors) == 0, "moved": done, "errors": errors}
 
 
@@ -301,6 +320,7 @@ async def api_upload(request: Request, dest: str = Form(...), file: UploadFile =
         while chunk := await file.read(1024 * 1024):
             out.write(chunk)
             size += len(chunk)
+    _audit("upload", target, f"size={size}")
     return {"ok": True, "path": target, "size": size}
 
 
@@ -310,6 +330,7 @@ async def api_download(request: Request, path: str, background: BackgroundTasks)
     p = _abs(path)
     _check_exists(p)
     if os.path.isfile(p):
+        _audit("download", p)
         return FileResponse(p, filename=os.path.basename(p))
     if not os.path.isdir(p):
         _fail("不支持的对象类型")
@@ -320,6 +341,7 @@ async def api_download(request: Request, path: str, background: BackgroundTasks)
                 full = os.path.join(root, fn)
                 zf.write(full, os.path.relpath(full, os.path.dirname(p)))
     background.add_task(os.remove, tmp)
+    _audit("download", p)
     return FileResponse(tmp, filename=os.path.basename(p) + ".zip")
 
 
@@ -367,6 +389,7 @@ async def api_unarchive(request: Request, body: UnarchiveBody):
         raise
     except Exception as e:
         raise HTTPException(500, f"解压失败: {e}")
+    _audit("unarchive", p, f"dest={dest}")
     return {"ok": True, "dest": dest}
 
 
@@ -802,8 +825,10 @@ async def api_kill(request: Request, body: KillBody):
         pr.terminate()
         gone, _ = psutil.wait_procs([pr], timeout=5)
         if gone:
+            _audit("kill", str(body.pid), "mode=terminate")
             return {"ok": True, "mode": "terminate"}
         pr.kill()
+        _audit("kill", str(body.pid), "mode=kill")
         return {"ok": True, "mode": "kill"}
     except psutil.AccessDenied:
         raise HTTPException(403, "无权限终止该进程")

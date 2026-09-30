@@ -1,35 +1,47 @@
-"""archive-node 归档机端：接收多来源机（dola-pool）的文件归档，支持回源拉取。
+"""archive-node 归档机：接收多来源机（dola-pool）文件归档 + 自带管理台。
 
-协议（全部走 HTTPS/HTTP，鉴权用 X-Archive-Key 头）：
-  GET  /health                          探活（无鉴权，仅返回版本与来源名列表）
-  POST /archive/push                    推送归档文件（query: source,fname,sha256,size,mtime,task_id）
-  GET  /archive/file/{source}/{fname}   拉取归档文件（回源）
-  GET  /archive/list/{source}           某来源机的归档清单
-  GET  /archive/stats                   全部来源机占用统计
+对外归档协议（X-Archive-Key 鉴权，来源机用）：
+  GET  /health                          探活（无鉴权）
+  GET  /archive/whoami                  按 key 返回登记名
+  POST /archive/push                    推送归档（query: fname,sha256,size[,mtime,task_id,source]）
+  GET  /archive/file/{source}/{fname}   回源拉取
+  GET  /archive/list/{source}           清单
+  GET  /archive/stats                   占用统计
 
-来源机在 config.json 的 sources 里登记（name + key + 配额），一机一 key。
-文件落盘 data/{source}/{fname}，清单记 SQLite（archive.db）。
-sha256 与 size 双重校验，一致才算归档成功；同 sha256 重复推送幂等秒回。
+管理台（X-Admin-Key 鉴权，管理员用）：
+  GET  /admin                           管理页面（资源管理/文件管理/来源机配置）
+  GET  /admin/api/overview              磁盘与各来源机占用统计
+  GET  /admin/api/files/{source}        文件清单（分页）
+  GET  /admin/api/file/{source}/{fname}/dl   下载文件
+  POST /admin/api/file/{source}/{fname}/delete  删除文件（磁盘+清单）
+  POST /admin/api/sources               保存来源机配置（写回 config.json）
+
+config.json：listen_port / admin_key / sources[{name,key,quota_mb}]。
+首次启动自动生成含随机 admin_key 的 config.json 并在日志打印。
 """
 import hashlib
 import json
 import os
+import secrets
+import shutil
 import sqlite3
 import time
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
-VERSION = "20260930a"
+VERSION = "20260930b"
+START_TS = time.time()
 
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
     "listen_port": 8100,
+    "admin_key": "archadmin-" + secrets.token_hex(8),
     "sources": [
         # 示例：把 name/key 发给对应来源机，来源机面板配置同样的地址+key 即完成挂载
         {"name": "A机", "key": "arch-change-me-a", "quota_mb": 2048}
@@ -41,19 +53,30 @@ app = FastAPI(title="archive-node", version=VERSION)
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
-        return DEFAULT_CONFIG
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+        print(f"[archive-node] 已生成默认配置，管理员 key：{DEFAULT_CONFIG['admin_key']}",
+              flush=True)
+        return json.loads(json.dumps(DEFAULT_CONFIG))
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def get_source(key: str | None) -> dict:
-    """按 key 找来源机配置；找不到即 401。"""
     if not key:
         raise HTTPException(401, "missing X-Archive-Key")
     for s in load_config().get("sources", []):
         if s.get("key") == key:
             return s
     raise HTTPException(401, "invalid archive key")
+
+
+def admin_auth(key: str | None) -> None:
+    if not key or key != load_config().get("admin_key"):
+        raise HTTPException(401, "invalid admin key")
 
 
 def db() -> sqlite3.Connection:
@@ -84,9 +107,10 @@ def source_usage(source: str) -> int:
     return sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
 
 
+# ==================== 归档协议（来源机） ====================
+
 @app.get("/health")
 async def health():
-    """探活：返回版本与已登记来源机名（不含 key）。"""
     cfg = load_config()
     return {"ok": True, "version": VERSION,
             "sources": [s.get("name") for s in cfg.get("sources", [])]}
@@ -94,7 +118,6 @@ async def health():
 
 @app.get("/archive/whoami")
 async def archive_whoami(x_archive_key: str | None = Header(default=None)):
-    """来源机挂载时调用：按 key 返回自己在归档机的登记名（push/回源路径用）。"""
     s = get_source(x_archive_key)
     return {"ok": True, "source": s.get("name"), "version": VERSION}
 
@@ -104,17 +127,12 @@ async def archive_push(request: Request,
                        fname: str, sha256: str, size: int,
                        source: str = "", mtime: int = 0, task_id: str = "",
                        x_archive_key: str | None = Header(default=None)):
-    """推送归档：流式收文件 → sha256 校验 → 落盘 → 记清单（幂等）。
-
-    - 来源机只需持有 key，source 缺省按 key 自动识别（传了则必须与登记名一致）
-    - 配额：来源机 data 目录总占用超 quota_mb 拒绝
-    - 同 (source, fname) 且 sha 一致 → dedup=true 幂等返回
-    """
+    """推送归档：流式收文件 → sha256 校验 → 落盘 → 记清单（幂等）。"""
     s = get_source(x_archive_key)
     if source and source != s.get("name"):
         raise HTTPException(403, f"source name mismatch: expect {s.get('name')}")
     source = s.get("name")
-    fname = Path(fname).name  # 防目录穿越
+    fname = Path(fname).name
     if not fname or fname.startswith("."):
         raise HTTPException(400, "bad fname")
     quota = int(s.get("quota_mb", 2048)) * 1024 * 1024
@@ -142,10 +160,8 @@ async def archive_push(request: Request,
         tmp.unlink(missing_ok=True)
         raise HTTPException(400, f"sha256 mismatch: got {digest} expect {sha256}")
 
-    dedup = False
-    if target.exists():
-        dedup = True  # 同名同 sha：幂等（sha 不同名冲突理论不发生，fname 带时间戳唯一）
-    else:
+    dedup = target.exists()
+    if not dedup:
         tmp.rename(target)
     tmp.unlink(missing_ok=True)
 
@@ -161,7 +177,7 @@ async def archive_push(request: Request,
     conn.commit()
     conn.close()
     if mtime:
-        os.utime(target, (mtime, mtime))  # 保留原修改时间
+        os.utime(target, (mtime, mtime))
     return {"ok": True, "dedup": dedup, "fname": fname, "sha256": digest,
             "usage_bytes": source_usage(source)}
 
@@ -169,7 +185,6 @@ async def archive_push(request: Request,
 @app.get("/archive/file/{source}/{fname}")
 async def archive_file(source: str, fname: str,
                        x_archive_key: str | None = Header(default=None)):
-    """回源拉取：来源机本地被清理后，从这里把文件拉回去服务用户。"""
     get_source(x_archive_key)
     fname = Path(fname).name
     target = DATA_DIR / source / fname
@@ -194,7 +209,6 @@ async def archive_list(source: str,
 
 @app.get("/archive/stats")
 async def archive_stats(x_archive_key: str | None = Header(default=None)):
-    """占用统计（任一来源 key 均可查，便于来源机面板展示）。"""
     get_source(x_archive_key)
     cfg = load_config()
     out = []
@@ -208,6 +222,325 @@ async def archive_stats(x_archive_key: str | None = Header(default=None)):
         out.append({"name": name, "files": cnt, "usage_bytes": used,
                     "quota_bytes": int(s.get("quota_mb", 2048)) * 1024 * 1024})
     return {"ok": True, "version": VERSION, "sources": out}
+
+
+# ==================== 管理台 ====================
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return ADMIN_HTML
+
+
+@app.get("/admin/api/overview")
+async def admin_overview(x_admin_key: str | None = Header(default=None)):
+    admin_auth(x_admin_key)
+    du = shutil.disk_usage(BASE)
+    cfg = load_config()
+    conn = db()
+    sources = []
+    for s in cfg.get("sources", []):
+        name = s.get("name")
+        row = conn.execute(
+            "SELECT count(*), coalesce(sum(size),0), coalesce(max(pushed_at),0) "
+            "FROM archive_files WHERE source=?", (name,)).fetchone()
+        sources.append({"name": name, "quota_mb": s.get("quota_mb", 2048),
+                        "files": row[0], "usage_bytes": row[1],
+                        "last_push": row[2],
+                        "disk_usage_bytes": source_usage(name)})
+    conn.close()
+    total_files = sum(x["files"] for x in sources)
+    return {"ok": True, "version": VERSION, "uptime_s": int(time.time() - START_TS),
+            "disk": {"total": du.total, "used": du.used, "free": du.free},
+            "archive_bytes": sum(x["usage_bytes"] for x in sources),
+            "total_files": total_files, "sources": sources}
+
+
+@app.get("/admin/api/files/{source}")
+async def admin_files(source: str, page: int = 1, page_size: int = 50,
+                      x_admin_key: str | None = Header(default=None)):
+    admin_auth(x_admin_key)
+    page = max(1, page)
+    page_size = min(max(10, page_size), 200)
+    conn = db()
+    total = conn.execute("SELECT count(*) FROM archive_files WHERE source=?",
+                         (source,)).fetchone()[0]
+    rows = conn.execute(
+        "SELECT fname,sha256,size,mtime,task_id,pushed_at FROM archive_files "
+        "WHERE source=? ORDER BY pushed_at DESC LIMIT ? OFFSET ?",
+        (source, page_size, (page - 1) * page_size)).fetchall()
+    conn.close()
+    return {"ok": True, "source": source, "total": total, "page": page,
+            "page_size": page_size,
+            "files": [{"fname": r[0], "sha256": r[1], "size": r[2], "mtime": r[3],
+                       "task_id": r[4], "pushed_at": r[5]} for r in rows]}
+
+
+@app.get("/admin/api/file/{source}/{fname}/dl")
+async def admin_file_dl(source: str, fname: str,
+                        x_admin_key: str | None = Header(default=None)):
+    admin_auth(x_admin_key)
+    target = DATA_DIR / Path(source).name / Path(fname).name
+    if not target.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(target, filename=target.name)
+
+
+async def _delete_one(source: str, fname: str) -> bool:
+    target = DATA_DIR / Path(source).name / Path(fname).name
+    existed = target.is_file()
+    target.unlink(missing_ok=True)
+    conn = db()
+    conn.execute("DELETE FROM archive_files WHERE source=? AND fname=?", (source, fname))
+    conn.commit()
+    conn.close()
+    return existed
+
+
+@app.post("/admin/api/file/{source}/{fname}/delete")
+async def admin_file_delete(source: str, fname: str,
+                            x_admin_key: str | None = Header(default=None)):
+    """删除单个归档文件（磁盘+清单）。注意：来源机回源将 404。"""
+    admin_auth(x_admin_key)
+    existed = await _delete_one(source, fname)
+    return {"ok": True, "existed": existed}
+
+
+@app.post("/admin/api/source/{source}/clear")
+async def admin_source_clear(source: str,
+                             x_admin_key: str | None = Header(default=None)):
+    """清空某来源机的全部归档文件。"""
+    admin_auth(x_admin_key)
+    d = DATA_DIR / Path(source).name
+    n = 0
+    if d.exists():
+        for f in d.rglob("*"):
+            if f.is_file():
+                f.unlink(missing_ok=True)
+                n += 1
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    conn = db()
+    conn.execute("DELETE FROM archive_files WHERE source=?", (source,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "deleted": n}
+
+
+@app.get("/admin/api/sources")
+async def admin_sources_get(x_admin_key: str | None = Header(default=None)):
+    admin_auth(x_admin_key)
+    cfg = load_config()
+    return {"ok": True, "admin_key": cfg.get("admin_key", ""),
+            "sources": cfg.get("sources", [])}
+
+
+@app.post("/admin/api/sources")
+async def admin_sources_save(request: Request,
+                             x_admin_key: str | None = Header(default=None)):
+    """保存来源机关联配置（整表替换，写回 config.json 立即生效）。
+
+    body: {"sources":[{"name","key","quota_mb"}], "admin_key": 可选改管理 key}
+    """
+    admin_auth(x_admin_key)
+    body = await request.json()
+    cfg = load_config()
+    sources = []
+    for i, s in enumerate(body.get("sources", [])):
+        name = (s.get("name") or "").strip()
+        key = (s.get("key") or "").strip()
+        if not name or not key:
+            continue
+        sources.append({"name": name, "key": key,
+                        "quota_mb": max(64, int(s.get("quota_mb") or 2048))})
+    cfg["sources"] = sources
+    nk = (body.get("admin_key") or "").strip()
+    if nk:
+        cfg["admin_key"] = nk
+    save_config(cfg)
+    return {"ok": True, "count": len(sources)}
+
+
+# ==================== 管理页面 ====================
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>archive-node 管理台</title>
+<style>
+:root{--bg:#101418;--card:#171d23;--line:#232b33;--tx:#d8dee5;--dim:#7a8794;
+--ac:#2f81f7;--ok:#00b875;--warn:#e5b567;--bad:#e5484d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:16px}
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.bar h1{font-size:17px;margin:0}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--ok);display:inline-block}
+.tag{font-size:11px;color:var(--dim)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px;margin-bottom:14px}
+.card h2{font-size:14px;margin:0 0 10px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500;font-size:12px}
+input,select{background:#0d1116;border:1px solid var(--line);border-radius:6px;
+color:var(--tx);padding:6px 9px;font-size:13px}
+input:focus{outline:none;border-color:var(--ac)}
+.btn{background:#1c242d;border:1px solid var(--line);border-radius:6px;color:var(--tx);
+padding:6px 12px;cursor:pointer;font-size:13px}
+.btn:hover{border-color:var(--ac)}
+.btn-p{background:var(--ac);border-color:var(--ac);color:#fff}
+.btn-danger{color:var(--bad)}
+.qbar{height:7px;background:#0d1116;border-radius:4px;overflow:hidden;min-width:90px}
+.qbar i{display:block;height:100%;background:var(--ok)}
+.qbar i.hot{background:var(--warn)}.qbar i.full{background:var(--bad)}
+.tiny{font-size:12px;color:var(--dim)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.pager{display:flex;gap:8px;align-items:center;margin-top:10px}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+#loginMask{position:fixed;inset:0;background:rgba(8,10,13,.96);display:flex;
+align-items:center;justify-content:center;z-index:9}
+#loginMask .card{width:min(360px,92vw)}
+.msg{font-size:12px;margin-left:8px}
+@media(max-width:640px){.wrap{padding:10px}table{font-size:12px}
+th,td{padding:5px 5px}.hide-m{display:none}}
+</style></head><body>
+<div id="loginMask" style="display:none">
+  <div class="card"><h2>archive-node 管理台</h2>
+    <div class="tiny" style="margin-bottom:10px">输入管理员 key（config.json 的 admin_key）</div>
+    <div class="row"><input id="loginKey" type="password" style="flex:1" placeholder="admin_key">
+    <button class="btn btn-p" onclick="doLogin()">进入</button></div>
+    <div id="loginMsg" class="tiny" style="color:var(--bad)"></div></div>
+</div>
+<div class="wrap">
+  <div class="bar"><span class="dot"></span><h1>archive-node 管理台</h1>
+    <span class="tag" id="verTag"></span>
+    <span class="tag" id="upTag"></span>
+    <span style="margin-left:auto" class="row">
+      <input id="akInput" style="width:180px" placeholder="admin_key">
+      <button class="btn" onclick="saveKey()">保存 key</button></span></div>
+
+  <div class="card"><h2>资源管理</h2><div id="ovBox" class="tiny">加载中…</div></div>
+
+  <div class="card"><h2>来源机关联配置</h2>
+    <div class="tiny" style="margin-bottom:8px">每行 = 一台来源机（dola-pool）。名称与 key 发给对方填入其面板「归档节点」即完成挂载；配额为该机可占用空间上限。</div>
+    <div id="srcRows"></div>
+    <div class="row"><button class="btn" onclick="addSrc()">＋ 添加来源机</button>
+    <button class="btn btn-p" onclick="saveSrc()">保存配置</button>
+    <span id="srcMsg" class="msg tiny"></span></div></div>
+
+  <div class="card"><h2>文件管理</h2>
+    <div class="row">
+      <select id="srcSel" onchange="loadFiles(1)"></select>
+      <button class="btn btn-danger" onclick="clearSource()">清空该来源机归档</button>
+      <span id="fileMsg" class="msg tiny"></span></div>
+    <div id="fileBox"></div>
+    <div class="pager" id="pager"></div></div>
+</div>
+<script>
+let AK=localStorage.getItem('arch_ak')||'';
+const q=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(1)+' KB';
+const fmtT=ts=>ts?new Date(ts*1000).toLocaleString():'—';
+async function api(path,opt={}){
+  const r=await fetch(path,{...opt,headers:{'X-Admin-Key':AK,'Content-Type':'application/json',...(opt.headers||{})}});
+  if(r.status===401){q('#loginMask').style.display='flex';throw new Error('unauthorized');}
+  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
+  return r.json();
+}
+async function doLogin(){
+  AK=q('#loginKey').value.trim();
+  try{await api('/admin/api/overview');localStorage.setItem('arch_ak',AK);
+    q('#loginMask').style.display='none';boot();}
+  catch(e){q('#loginMsg').textContent='key 无效';}
+}
+function saveKey(){AK=q('#akInput').value.trim();localStorage.setItem('arch_ak',AK);
+  q('#akInput').value='';boot();}
+function bar(used,quota){const p=Math.min(100,quota?used/quota*100:0);
+  const cls=p>=90?'full':p>=70?'hot':'';
+  return `<div style="display:flex;gap:6px;align-items:center"><div class="qbar" style="flex:1"><i class="${cls}" style="width:${p}%"></i></div><span class="tiny">${p.toFixed(0)}%</span></div>`;}
+async function loadOverview(){
+  const o=await api('/admin/api/overview');
+  q('#verTag').textContent='v'+o.version;
+  const up=o.uptime_s,uh=Math.floor(up/3600),um=Math.floor(up%3600/60);
+  q('#upTag').textContent=`已运行 ${uh}时${um}分`;
+  const d=o.disk,dp=(d.used/d.total*100).toFixed(1);
+  q('#ovBox').innerHTML=`
+    <div class="row" style="gap:16px">
+      <span>磁盘 <b>${fmtB(d.used)}</b> / ${fmtB(d.total)}（已用 ${dp}%，剩 ${fmtB(d.free)}）</span>
+      <span>归档总量 <b>${fmtB(o.archive_bytes)}</b> · ${o.total_files} 个文件</span></div>
+    <table><tr><th>来源机</th><th>文件数</th><th>占用/配额</th><th style="width:140px">配额使用</th><th class="hide-m">最近推送</th></tr>
+    ${o.sources.map(s=>`<tr><td><b>${esc(s.name)}</b></td><td>${s.files}</td>
+      <td>${fmtB(s.usage_bytes)} / ${s.quota_mb} MB</td>
+      <td>${bar(s.usage_bytes,s.quota_mb*1048576)}</td>
+      <td class="hide-m">${fmtT(s.last_push)}</td></tr>`).join('')||'<tr><td colspan="5" class="tiny">尚未登记来源机</td></tr>'}
+    </table>`;
+}
+let SRC=[];
+async function loadSources(){
+  const r=await api('/admin/api/sources');SRC=r.sources||[];
+  q('#srcRows').innerHTML=SRC.length?SRC.map((s,i)=>`
+    <div class="row src-row">
+      <input class="s-name" style="width:130px" placeholder="名称（如 A机）" value="${esc(s.name)}">
+      <input class="s-key mono" style="flex:1;min-width:180px" placeholder="key" value="${esc(s.key)}">
+      <input class="s-quota" style="width:110px" placeholder="配额MB" value="${s.quota_mb||2048}">
+      <button class="btn btn-danger" onclick="this.parentElement.remove()">删除</button></div>`).join('')
+    :'<div class="tiny" style="margin-bottom:8px">尚未登记来源机</div>';
+  const opts=SRC.map(s=>`<option>${esc(s.name)}</option>`).join('');
+  q('#srcSel').innerHTML=opts||'<option value="">（无来源机）</option>';
+  q('#akInput').placeholder='修改 admin_key';
+}
+function addSrc(){const div=document.createElement('div');div.className='row src-row';
+  div.innerHTML=`<input class="s-name" style="width:130px" placeholder="名称（如 A机）">
+    <input class="s-key mono" style="flex:1;min-width:180px" placeholder="key">
+    <input class="s-quota" style="width:110px" placeholder="配额MB" value="2048">
+    <button class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>`;
+  q('#srcRows').appendChild(div);}
+async function saveSrc(){
+  const sources=[...q('#srcRows').querySelectorAll('.src-row')].map(r=>({
+    name:r.querySelector('.s-name').value.trim(),
+    key:r.querySelector('.s-key').value.trim(),
+    quota_mb:parseInt(r.querySelector('.s-quota').value)||2048
+  })).filter(s=>s.name&&s.key);
+  await api('/admin/api/sources',{method:'POST',body:{sources,admin_key:''}});
+  const m=q('#srcMsg');m.textContent='已保存（写回 config.json，立即生效）';
+  setTimeout(()=>m.textContent='',3000);
+  await loadSources();await loadOverview();}
+let curPage=1;
+async function loadFiles(p){
+  curPage=p||1;const src=q('#srcSel').value;
+  if(!src){q('#fileBox').innerHTML='<div class="tiny">无来源机</div>';q('#pager').innerHTML='';return;}
+  const r=await api(`/admin/api/files/${encodeURIComponent(src)}?page=${curPage}&page_size=50`);
+  q('#fileBox').innerHTML=`<table><tr><th>文件名</th><th>大小</th><th class="hide-m">归档时间</th><th class="hide-m">任务</th><th>操作</th></tr>
+    ${r.files.map(f=>`<tr><td class="mono" title="${esc(f.sha256)}">${esc(f.fname)}</td>
+      <td>${fmtB(f.size)}</td><td class="hide-m">${fmtT(f.pushed_at)}</td>
+      <td class="hide-m tiny">${esc(f.task_id||'')}</td>
+      <td><a class="btn" style="text-decoration:none" href="/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(f.fname)}/dl" download>下载</a>
+      <button class="btn btn-danger" onclick="delFile('${esc(src)}','${esc(f.fname)}')">删除</button></td></tr>`).join('')
+    ||'<tr><td colspan="5" class="tiny">暂无归档文件</td></tr>'}</table>`;
+  const pages=Math.max(1,Math.ceil(r.total/r.page_size));
+  q('#pager').innerHTML=`<span class="tiny">共 ${r.total} 个 · 第 ${r.page}/${pages} 页</span>
+    ${r.page>1?`<button class="btn" onclick="loadFiles(${r.page-1})">上一页</button>`:''}
+    ${r.page<pages?`<button class="btn" onclick="loadFiles(${r.page+1})">下一页</button>`:''}`;
+}
+async function delFile(src,fname){
+  if(!confirm('确认删除 '+fname+'？（来源机回源将失效）'))return;
+  await api(`/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(fname)}/delete`,{method:'POST'});
+  loadFiles(curPage);loadOverview();}
+async function clearSource(){
+  const src=q('#srcSel').value;if(!src)return;
+  if(!confirm('确认清空来源机「'+src+'」的全部归档文件？'))return;
+  const r=await api(`/admin/api/source/${encodeURIComponent(src)}/clear`,{method:'POST'});
+  const m=q('#fileMsg');m.textContent=`已删除 ${r.deleted} 个文件`;
+  setTimeout(()=>m.textContent='',4000);loadFiles(1);loadOverview();}
+function boot(){loadOverview().catch(()=>{});loadSources().then(()=>loadFiles(1)).catch(()=>{});}
+if(AK){api('/admin/api/overview').then(()=>boot()).catch(()=>{});
+  q('#akInput').addEventListener('change',saveKey);}
+else q('#loginMask').style.display='flex';
+</script></body></html>"""
 
 
 if __name__ == "__main__":

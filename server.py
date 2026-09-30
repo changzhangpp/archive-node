@@ -40,7 +40,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930e"
+VERSION = "20260930f"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -586,13 +586,6 @@ def _audit_where(actor: str, action: str, q: str):
     return (" WHERE " + " AND ".join(where)) if where else "", args
 
 
-def _mask_key(k: str) -> str:
-    """key 脱敏展示：短 key 仅留前 2 位，长 key 留前 6 后 4。"""
-    if not k:
-        return "（未登记）"
-    return k[:2] + "****" if len(k) <= 10 else k[:6] + "****" + k[-4:]
-
-
 @app.get("/admin/api/audit")
 async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
                       action: str = "", q: str = "",
@@ -604,8 +597,6 @@ async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
     w, args = _audit_where(actor, action, q)
     cfg = load_config()
     days = int(cfg.get("audit_retention_days", 30) or 30)
-    key_map = {s.get("name", ""): s.get("key", "") for s in cfg.get("sources", [])}
-    admin_masked = _mask_key(cfg.get("admin_key", ""))
     conn = audit_db()
     total = conn.execute("SELECT count(*) FROM audit_log" + w, args).fetchone()[0]
     rows = conn.execute(
@@ -616,8 +607,6 @@ async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
     return {"ok": True, "retention_days": days, "total": total, "page": page,
             "page_size": page_size,
             "logs": [{"ts": r[0], "actor_type": r[1], "actor": r[2],
-                      "actor_key": admin_masked if r[1] == "admin"
-                      else _mask_key(key_map.get(r[2], "")),
                       "action": r[3], "target": r[4], "detail": r[5]}
                      for r in rows]}
 
@@ -692,6 +681,7 @@ padding:6px 12px;cursor:pointer;font-size:13px}
 .qbar i{display:block;height:100%;background:var(--ok)}
 .qbar i.hot{background:var(--warn)}.qbar i.full{background:var(--bad)}
 .tiny{font-size:12px;color:var(--dim)}
+.nw{white-space:nowrap}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
 .pager{display:flex;gap:8px;align-items:center;margin-top:10px}
 .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
@@ -728,7 +718,7 @@ th,td{padding:5px 5px}.hide-m{display:none}}
     <button class="navbtn active" data-view="overview" onclick="showView('overview')">资源管理</button>
     <button class="navbtn" data-view="files" onclick="showView('files')">文件管理</button>
     <button class="navbtn" data-view="sources" onclick="showView('sources')">来源机配置</button>
-    <button class="navbtn" data-view="audit" onclick="showView('audit')">操作日志</button>
+    <button class="navbtn" data-view="audit" onclick="showView('audit')">日志</button>
   </div>
 
   <div class="view active" id="view-overview">
@@ -755,7 +745,7 @@ th,td{padding:5px 5px}.hide-m{display:none}}
   </div>
 
   <div class="view" id="view-audit">
-  <div class="card"><h2>操作日志 <span class="tiny">（保留 <span id="audDays">30</span> 天，按 key 来源记录）</span></h2>
+  <div class="card"><h2>日志 <span class="tiny">（保留 <span id="audDays">30</span> 天）</span></h2>
     <div class="row">
       <select id="audActor" onchange="loadAudit(1)"><option value="">全部操作者</option></select>
       <select id="audAction" onchange="loadAudit(1)">
@@ -898,10 +888,10 @@ async function loadAudit(p){
   const r=await api('/admin/api/audit?'+audQs(true));
   q('#audDays').textContent=r.retention_days??30;
   const pages=Math.max(1,Math.ceil(r.total/r.page_size));
-  q('#audBox').innerHTML=`<table><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
+  q('#audBox').innerHTML=`<table><tr><th class="hide-m">时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
     ${r.logs.map(x=>`<tr><td class="hide-m">${fmtT(x.ts)}</td>
-      <td><b>${x.actor_type==='admin'?'归档机':esc(x.actor)}</b><span class="tiny"> ${x.actor_type==='admin'?'（管理 key ':'（来源机 key '}${esc(x.actor_key||'')}）</span></td>
-      <td>${AUD_ACT[x.action]||esc(x.action)}</td>
+      <td class="nw"><b>${x.actor_type==='admin'?'归档机':esc(x.actor)}</b></td>
+      <td class="nw">${AUD_ACT[x.action]||esc(x.action)}</td>
       <td class="mono">${x.target?esc(x.target).split('; ').join('<br>'):'—'}</td>
       <td class="tiny hide-m">${esc(x.detail)||'—'}</td></tr>`).join('')
     ||'<tr><td colspan="5" class="tiny">暂无日志</td></tr>'}</table>`;

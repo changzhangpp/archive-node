@@ -40,7 +40,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930d"
+VERSION = "20260930e"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -586,6 +586,13 @@ def _audit_where(actor: str, action: str, q: str):
     return (" WHERE " + " AND ".join(where)) if where else "", args
 
 
+def _mask_key(k: str) -> str:
+    """key 脱敏展示：短 key 仅留前 2 位，长 key 留前 6 后 4。"""
+    if not k:
+        return "（未登记）"
+    return k[:2] + "****" if len(k) <= 10 else k[:6] + "****" + k[-4:]
+
+
 @app.get("/admin/api/audit")
 async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
                       action: str = "", q: str = "",
@@ -595,7 +602,10 @@ async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
     page = max(1, page)
     page_size = min(max(10, page_size), 200)
     w, args = _audit_where(actor, action, q)
-    days = int(load_config().get("audit_retention_days", 30) or 30)
+    cfg = load_config()
+    days = int(cfg.get("audit_retention_days", 30) or 30)
+    key_map = {s.get("name", ""): s.get("key", "") for s in cfg.get("sources", [])}
+    admin_masked = _mask_key(cfg.get("admin_key", ""))
     conn = audit_db()
     total = conn.execute("SELECT count(*) FROM audit_log" + w, args).fetchone()[0]
     rows = conn.execute(
@@ -606,6 +616,8 @@ async def admin_audit(page: int = 1, page_size: int = 50, actor: str = "",
     return {"ok": True, "retention_days": days, "total": total, "page": page,
             "page_size": page_size,
             "logs": [{"ts": r[0], "actor_type": r[1], "actor": r[2],
+                      "actor_key": admin_masked if r[1] == "admin"
+                      else _mask_key(key_map.get(r[2], "")),
                       "action": r[3], "target": r[4], "detail": r[5]}
                      for r in rows]}
 
@@ -888,9 +900,9 @@ async function loadAudit(p){
   const pages=Math.max(1,Math.ceil(r.total/r.page_size));
   q('#audBox').innerHTML=`<table><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
     ${r.logs.map(x=>`<tr><td class="hide-m">${fmtT(x.ts)}</td>
-      <td><b>${esc(x.actor)}</b><span class="tiny"> ${x.actor_type==='admin'?'（管理台）':'（来源机）'}</span></td>
+      <td><b>${x.actor_type==='admin'?'归档机':esc(x.actor)}</b><span class="tiny"> ${x.actor_type==='admin'?'（管理 key ':'（来源机 key '}${esc(x.actor_key||'')}）</span></td>
       <td>${AUD_ACT[x.action]||esc(x.action)}</td>
-      <td class="mono">${esc(x.target)||'—'}</td>
+      <td class="mono">${x.target?esc(x.target).split('; ').join('<br>'):'—'}</td>
       <td class="tiny hide-m">${esc(x.detail)||'—'}</td></tr>`).join('')
     ||'<tr><td colspan="5" class="tiny">暂无日志</td></tr>'}</table>`;
   q('#audPager').innerHTML=`<span class="tiny">共 ${r.total} 条 · 第 ${r.page}/${pages} 页</span>

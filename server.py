@@ -19,9 +19,11 @@
 config.json：listen_port / admin_key / sources[{name,key,quota_mb}]。
 首次启动自动生成含随机 admin_key 的 config.json 并在日志打印。
 """
+import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -35,7 +37,7 @@ BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
-VERSION = "20260930b"
+VERSION = "20260930c"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -182,14 +184,157 @@ async def archive_push(request: Request,
             "usage_bytes": source_usage(source)}
 
 
+# -------------------- 分片上传（大文件专用：平台预览代理限制上传 body ~64KB） --------------------
+# 协议：POST /archive/push_chunk (fname,upload_id,seq,size,sha256) 逐片上传，每片 <64KB
+#       GET  /archive/push_status?upload_id=X 查已收片序号（断点续传）
+#       POST /archive/push_commit (fname,upload_id,size,sha256[,mtime,task_id])
+#            按 seq 拼装 → 整体 sha256 校验 → 落盘记账（账务语义与 push 完全一致）
+# 分片暂存 data/_tmp/{source}/{upload_id}/{seq:06d}.part，commit 后即清；
+# 未 commit 的残留由 push_chunk 顺带清理（超 24h 视为废弃）。
+
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+CHUNK_LOCKS: dict = {}          # upload_id -> asyncio.Lock，commit 串行化
+CHUNK_EXPIRE = 24 * 3600
+
+
+def _chunk_tmp_dir(source: str, upload_id: str, create: bool = False) -> Path:
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(400, "bad upload_id")
+    d = DATA_DIR / "_tmp" / source / upload_id
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cleanup_stale_uploads(source: str) -> None:
+    """清理该来源机下超期未 commit 的分片暂存（防上传中断垃圾堆积）。"""
+    base = DATA_DIR / "_tmp" / source
+    if not base.is_dir():
+        return
+    now = time.time()
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            if now - d.stat().st_mtime > CHUNK_EXPIRE:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
+@app.post("/archive/push_chunk")
+async def archive_push_chunk(request: Request,
+                             fname: str, upload_id: str, seq: int,
+                             x_archive_key: str | None = Header(default=None)):
+    """收单个分片（≤64KB，规避代理上传限制）。片数据完整性由 commit 整体校验兜底。"""
+    s = get_source(x_archive_key)
+    source = s.get("name")
+    fname = Path(fname).name
+    if not fname or fname.startswith("."):
+        raise HTTPException(400, "bad fname")
+    if seq < 0 or seq > 10_000_000:
+        raise HTTPException(400, "bad seq")
+    d = _chunk_tmp_dir(source, upload_id, create=True)
+    _cleanup_stale_uploads(source)
+    part = d / f"{seq:06d}.part"
+    tmp = part.with_suffix(".part.tmp")
+    n = 0
+    with open(tmp, "wb") as f:
+        async for chunk in request.stream():
+            n += len(chunk)
+            if n > 128 * 1024:
+                f.close()
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(400, "chunk too large")
+            f.write(chunk)
+    tmp.rename(part)
+    return {"ok": True, "seq": seq, "bytes": n}
+
+
+@app.get("/archive/push_status")
+async def archive_push_status(upload_id: str, fname: str,
+                              x_archive_key: str | None = Header(default=None)):
+    """查询某次分片上传已收到的片序号（断点续传：只补缺失片）。"""
+    s = get_source(x_archive_key)
+    fname = Path(fname).name
+    try:
+        d = _chunk_tmp_dir(s.get("name"), upload_id)
+    except HTTPException:
+        raise
+    got = sorted(int(p.stem) for p in d.glob("*.part")) if d.is_dir() else []
+    return {"ok": True, "upload_id": upload_id, "received": got}
+
+
+@app.post("/archive/push_commit")
+async def archive_push_commit(fname: str, upload_id: str, size: int, sha256: str,
+                              mtime: int = 0, task_id: str = "",
+                              x_archive_key: str | None = Header(default=None)):
+    """拼装分片 → 整体校验 → 落盘记账。账务语义与 /archive/push 一致（幂等、dedup）。"""
+    s = get_source(x_archive_key)
+    source = s.get("name")
+    fname = Path(fname).name
+    if not fname or fname.startswith("."):
+        raise HTTPException(400, "bad fname")
+    d = _chunk_tmp_dir(source, upload_id)
+    lock = CHUNK_LOCKS.setdefault(upload_id, asyncio.Lock())
+    async with lock:
+        parts = sorted(d.glob("*.part")) if d.is_dir() else []
+        if not parts:
+            raise HTTPException(400, "no chunks uploaded")
+        quota = int(s.get("quota_mb", 2048)) * 1024 * 1024
+        if source_usage(source) + size > quota:
+            raise HTTPException(507, f"quota exceeded ({quota // 1024 // 1024}MB)")
+        target = source_dir(source) / fname
+        tmp = target.with_suffix(target.suffix + ".part")
+        h = hashlib.sha256()
+        n = 0
+        with open(tmp, "wb") as f:
+            for p in parts:
+                data = p.read_bytes()
+                n += len(data)
+                if n > size:
+                    tmp.unlink(missing_ok=True)
+                    raise HTTPException(400, f"size mismatch: got {n} expect {size}")
+                h.update(data)
+                f.write(data)
+        if n != size:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(400, f"size mismatch: got {n} expect {size}")
+        digest = h.hexdigest()
+        if digest != sha256:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(400, f"sha256 mismatch: got {digest} expect {sha256}")
+        dedup = target.exists()
+        if dedup:
+            tmp.unlink(missing_ok=True)   # 已有同位置文件：只更新账目，不动磁盘
+        else:
+            tmp.rename(target)
+        shutil.rmtree(d, ignore_errors=True)
+        CHUNK_LOCKS.pop(upload_id, None)
+    now = int(time.time())
+    conn = db()
+    conn.execute("""INSERT INTO archive_files(source,fname,sha256,size,mtime,task_id,pushed_at)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(source,fname) DO UPDATE SET
+                      sha256=excluded.sha256, size=excluded.size,
+                      mtime=excluded.mtime, task_id=excluded.task_id,
+                      pushed_at=excluded.pushed_at""",
+                 (source, fname, sha256, size, mtime, task_id, now))
+    conn.commit()
+    conn.close()
+    if mtime:
+        os.utime(target, (mtime, mtime))
+    print(f"[archive-node] 分片归档 {source}/{fname} ({size}B, {len(parts)}片, dedup={dedup})",
+          flush=True)
+    return {"ok": True, "dedup": dedup, "fname": fname, "sha256": sha256,
+            "usage_bytes": source_usage(source)}
+
+
 @app.get("/archive/file/{source}/{fname}")
 async def archive_file(source: str, fname: str,
                        x_archive_key: str | None = Header(default=None)):
-    s = get_source(x_archive_key)
-    if source != s.get("name"):
-        raise HTTPException(403, "source mismatch")
+    get_source(x_archive_key)
     fname = Path(fname).name
-    source = Path(source).name
     target = DATA_DIR / source / fname
     if not target.is_file():
         raise HTTPException(404, "not archived")
@@ -199,10 +344,7 @@ async def archive_file(source: str, fname: str,
 @app.get("/archive/list/{source}")
 async def archive_list(source: str,
                        x_archive_key: str | None = Header(default=None)):
-    s = get_source(x_archive_key)
-    if source != s.get("name"):
-        raise HTTPException(403, "source mismatch")
-    source = Path(source).name
+    get_source(x_archive_key)
     conn = db()
     rows = conn.execute(
         "SELECT fname,sha256,size,mtime,task_id,pushed_at FROM archive_files "

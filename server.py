@@ -283,9 +283,10 @@ async def archive_push_commit(fname: str, upload_id: str, size: int, sha256: str
         parts = sorted(d.glob("*.part")) if d.is_dir() else []
         if not parts:
             raise HTTPException(400, "no chunks uploaded")
-        quota = int(s.get("quota_mb", 2048)) * 1024 * 1024
-        if source_usage(source) + size > quota:
-            raise HTTPException(507, f"quota exceeded ({quota // 1024 // 1024}MB)")
+        quota_mb = int(s.get("quota_mb", 0) or 0)
+        quota = quota_mb * 1024 * 1024
+        if quota > 0 and source_usage(source) + size > quota:
+            raise HTTPException(507, f"quota exceeded ({quota_mb}MB)")
         target = source_dir(source) / fname
         tmp = target.with_suffix(target.suffix + ".part")
         h = hashlib.sha256()

@@ -40,7 +40,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930f"
+VERSION = "20260930g"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -776,6 +776,8 @@ const q=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(1)+' KB';
 const fmtT=ts=>ts?new Date(ts*1000).toLocaleString():'—';
+const fmtAT=ts=>{if(!ts)return '—';const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
 async function api(path,opt={}){
   const b=(opt.body&&typeof opt.body==='object')?JSON.stringify(opt.body):opt.body;
   const r=await fetch(path,{...opt,body:b,headers:{'X-Admin-Key':AK,'Content-Type':'application/json',...(opt.headers||{})}});
@@ -888,8 +890,8 @@ async function loadAudit(p){
   const r=await api('/admin/api/audit?'+audQs(true));
   q('#audDays').textContent=r.retention_days??30;
   const pages=Math.max(1,Math.ceil(r.total/r.page_size));
-  q('#audBox').innerHTML=`<table><tr><th class="hide-m">时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
-    ${r.logs.map(x=>`<tr><td class="hide-m">${fmtT(x.ts)}</td>
+  q('#audBox').innerHTML=`<table><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th class="hide-m">详情</th></tr>
+    ${r.logs.map(x=>`<tr><td class="mono nw">${fmtAT(x.ts)}</td>
       <td class="nw"><b>${x.actor_type==='admin'?'归档机':esc(x.actor)}</b></td>
       <td class="nw">${AUD_ACT[x.action]||esc(x.action)}</td>
       <td class="mono">${x.target?esc(x.target).split('; ').join('<br>'):'—'}</td>

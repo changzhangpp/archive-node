@@ -497,7 +497,10 @@ async def admin_sources_save(request: Request,
     body: {"sources":[{"name","key","quota_mb"}], "admin_key": 可选改管理 key}（quota_mb=0 不限）
     """
     admin_auth(x_admin_key)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "bad json body")
     cfg = load_config()
     sources = []
     for i, s in enumerate(body.get("sources", [])):
@@ -618,7 +621,8 @@ const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(1)+' KB';
 const fmtT=ts=>ts?new Date(ts*1000).toLocaleString():'—';
 async function api(path,opt={}){
-  const r=await fetch(path,{...opt,headers:{'X-Admin-Key':AK,'Content-Type':'application/json',...(opt.headers||{})}});
+  const b=(opt.body&&typeof opt.body==='object')?JSON.stringify(opt.body):opt.body;
+  const r=await fetch(path,{...opt,body:b,headers:{'X-Admin-Key':AK,'Content-Type':'application/json',...(opt.headers||{})}});
   if(r.status===401){q('#loginMask').style.display='flex';throw new Error('unauthorized');}
   if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
   return r.json();

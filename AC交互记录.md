@@ -1,0 +1,14 @@
+# AC 交互台账（archive-node 仓库）
+
+> 角色约定：
+> - **A** = A 机（dola-pool 来源机，沙箱 /workspace，面板 8004）
+> - **C** = 归档机部署方（本仓库的部署与运行方，平台预览域名对外）
+> - 本仓库为归档机服务端独立仓库；dola-pool 侧另有 AB 交互台账（`dola-pool/AB交互记录.md`），两台账通过编号互相引用（如 A#65 指 dola-pool 台账条目）
+> - 约束：先登记后处理；单元格内禁用裸竖线 `|`（用「；」或「/」替代）；每行竖线数对齐
+
+| 编号 | 日期 | 方向 | 类型 | 事项 | 详情 | 状态 |
+|---|---|---|---|---|---|---|
+| C#0 | 2026-09-30 | 基线 | 部署记录 | 归档机首次真机部署 | 仓库 main=20aab5d4（v20260930b，含 B#58 source 穿越修复+管理台）；C 部署地址 https://8100-6050e879a6f9affc.monkeycode-ai.online ；A 机 key arch-change-me-a（登记名「A机」，配额 19.5GB）；A 机面板已挂载并验证小文件闭环（push→sha→记账→回源一致） | 已完成 |
+| A#1 | 2026-09-30 | A→C | 协议变更 | 分片上传协议（应对平台代理上传限制） | **背景**：A#65（dola-pool 台账）实测平台预览代理对上传 body 限制在 64~128KB 之间（64KB 过/128KB 挂死），且代理不支持 keep-alive 连接复用（复用连接第二请求起挂死）；GET 与响应方向不受影响。真实视频产物 MB 级，原 /archive/push 单请求通道必挂。**A 变动（commit bbedae2，v20260930c，+151 行纯新增不动存量）**：①POST /archive/push_chunk——逐片接收（单片超 128KB 拒 400），落 data/_tmp/{source}/{upload_id}/{seq:06d}.part，顺带清理该 source 下超 24h 的废弃暂存目录；②GET /archive/push_status——按 upload_id 返回已收片序号（断点续传用）；③POST /archive/push_commit——按 seq 拼装→整体 sha256 校验→落盘记账，账务语义与 /archive/push 完全一致（幂等/dedup/配额 507/mtime 回写）；安全措施：upload_id 走 hex 白名单 `^[0-9a-f]{8,64}$` 防路径穿越、fname 沿用既有清洗、commit 持 asyncio.Lock 串行化。**本地验证**（127.0.0.1:8001 临时实例）：2MB/43 片闭环 0.09s 回源 sha 一致；五项边界全绿（缺片 commit 400、status 报缺失后补片 commit 200、单片篡改 400 sha mismatch、非法 upload_id 400、超大片 400）。 | 已完成（待 C 更新部署） |
+| A#1-交C | 2026-09-30 | A→C | 交代事项 | C 需要做的三步 | ①在归档机沙箱部署目录执行 `git pull`（拉到 bbedae2）；②重启归档机服务（重启方式同你当初部署：`setsid nohup python3 -m uvicorn server:app --host 0.0.0.0 --port 8100 > 归档日志 2>&1 < /dev/null &`，注意先按旧 PID 停旧进程——上一轮 A#65 排查时有 5 个大 body 挂死请求可能占着 worker，重启顺带清掉）；③重启后回传 `curl https://8100-6050e879a6f9affc.monkeycode-ai.online/health` 的结果（version 应显示 **20260930c**）。**注意**：本次更新不改 config.json/data/archive.db，拉取重启即可，无需迁移。 | 待 C 执行 |
+| A#1-联调 | — | A | 后续计划 | C 就位后 A 立即做大文件真机联调 | A 造 10MB 测试产物（mtime 8 天前）→ 触发归档（走分片）→ 核对双边账与归档机磁盘文件 → 删本地 → 历史 URL 回源 → sha256 比对。全绿后归档主链路（视频产物）正式可用，结果登记回本台账并同步 dola-pool 台账 A#66 | 待 A#1-交C 完成 |

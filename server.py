@@ -16,7 +16,7 @@
   POST /admin/api/file/{source}/{fname}/delete  删除文件（磁盘+清单）
   POST /admin/api/sources               保存来源机配置（写回 config.json）
 
-config.json：listen_port / admin_key / sources[{name,key,quota_mb}]。
+config.json：listen_port / admin_key / sources[{name,key,quota_mb}]（quota_mb=0 表示不限制，用满磁盘）。
 首次启动自动生成含随机 admin_key 的 config.json 并在日志打印。
 """
 import asyncio
@@ -37,6 +37,7 @@ BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
+WEB_DIR = BASE / "web"
 VERSION = "20260930c"
 START_TS = time.time()
 
@@ -46,7 +47,7 @@ DEFAULT_CONFIG = {
     "admin_key": "archadmin-" + secrets.token_hex(8),
     "sources": [
         # 示例：把 name/key 发给对应来源机，来源机面板配置同样的地址+key 即完成挂载
-        {"name": "A机", "key": "arch-change-me-a", "quota_mb": 2048}
+        {"name": "A机", "key": "arch-change-me-a", "quota_mb": 0}
     ]
 }
 
@@ -137,9 +138,10 @@ async def archive_push(request: Request,
     fname = Path(fname).name
     if not fname or fname.startswith("."):
         raise HTTPException(400, "bad fname")
-    quota = int(s.get("quota_mb", 2048)) * 1024 * 1024
-    if source_usage(source) + size > quota:
-        raise HTTPException(507, f"quota exceeded ({quota // 1024 // 1024}MB)")
+    quota_mb = int(s.get("quota_mb", 0) or 0)
+    quota = quota_mb * 1024 * 1024
+    if quota > 0 and source_usage(source) + size > quota:
+        raise HTTPException(507, f"quota exceeded ({quota_mb}MB)")
 
     target = source_dir(source) / fname
     tmp = target.with_suffix(target.suffix + ".part")
@@ -150,7 +152,7 @@ async def archive_push(request: Request,
             n += len(chunk)
             h.update(chunk)
             f.write(chunk)
-            if n > quota:
+            if quota > 0 and n > quota:
                 f.close()
                 tmp.unlink(missing_ok=True)
                 raise HTTPException(507, "quota exceeded during upload")
@@ -367,8 +369,10 @@ async def archive_stats(x_archive_key: str | None = Header(default=None)):
                            (name,)).fetchone()[0]
         conn.close()
         used = source_usage(name)
+        qm = int(s.get("quota_mb", 0) or 0)
         out.append({"name": name, "files": cnt, "usage_bytes": used,
-                    "quota_bytes": int(s.get("quota_mb", 2048)) * 1024 * 1024})
+                    "quota_bytes": qm * 1024 * 1024 if qm > 0
+                    else shutil.disk_usage(BASE).total})
     return {"ok": True, "version": VERSION, "sources": out}
 
 
@@ -376,7 +380,7 @@ async def archive_stats(x_archive_key: str | None = Header(default=None)):
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
-    return ADMIN_HTML
+    return ADMIN_HTML.replace("<body>", "<body>" + sys_nav("admin"), 1)
 
 
 @app.get("/admin/api/overview")
@@ -391,7 +395,7 @@ async def admin_overview(x_admin_key: str | None = Header(default=None)):
         row = conn.execute(
             "SELECT count(*), coalesce(sum(size),0), coalesce(max(pushed_at),0) "
             "FROM archive_files WHERE source=?", (name,)).fetchone()
-        sources.append({"name": name, "quota_mb": s.get("quota_mb", 2048),
+        sources.append({"name": name, "quota_mb": int(s.get("quota_mb", 0) or 0),
                         "files": row[0], "usage_bytes": row[1],
                         "last_push": row[2],
                         "disk_usage_bytes": source_usage(name)})
@@ -489,7 +493,7 @@ async def admin_sources_save(request: Request,
                              x_admin_key: str | None = Header(default=None)):
     """保存来源机关联配置（整表替换，写回 config.json 立即生效）。
 
-    body: {"sources":[{"name","key","quota_mb"}], "admin_key": 可选改管理 key}
+    body: {"sources":[{"name","key","quota_mb"}], "admin_key": 可选改管理 key}（quota_mb=0 不限）
     """
     admin_auth(x_admin_key)
     body = await request.json()
@@ -500,8 +504,8 @@ async def admin_sources_save(request: Request,
         key = (s.get("key") or "").strip()
         if not name or not key:
             continue
-        sources.append({"name": name, "key": key,
-                        "quota_mb": max(64, int(s.get("quota_mb") or 2048))})
+        qm = int(s.get("quota_mb") or 0)
+        sources.append({"name": name, "key": key, "quota_mb": max(0, qm)})
     cfg["sources"] = sources
     nk = (body.get("admin_key") or "").strip()
     if nk:
@@ -552,6 +556,13 @@ padding:6px 12px;cursor:pointer;font-size:13px}
 align-items:center;justify-content:center;z-index:9}
 #loginMask .card{width:min(360px,92vw)}
 .msg{font-size:12px;margin-left:8px}
+.nav{display:flex;gap:6px;margin-bottom:14px;border-bottom:1px solid var(--line)}
+.navbtn{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--dim);
+padding:8px 14px;cursor:pointer;font-size:14px}
+.navbtn:hover{color:var(--tx)}
+.navbtn.active{color:var(--tx);border-bottom-color:var(--ac)}
+.view{display:none}
+.view.active{display:block}
 @media(max-width:640px){.wrap{padding:10px}table{font-size:12px}
 th,td{padding:5px 5px}.hide-m{display:none}}
 </style></head><body>
@@ -570,15 +581,26 @@ th,td{padding:5px 5px}.hide-m{display:none}}
       <input id="akInput" style="width:180px" placeholder="admin_key">
       <button class="btn" onclick="saveKey()">保存 key</button></span></div>
 
-  <div class="card"><h2>资源管理</h2><div id="ovBox" class="tiny">加载中…</div></div>
+  <div class="nav" id="nav">
+    <button class="navbtn active" data-view="overview" onclick="showView('overview')">资源管理</button>
+    <button class="navbtn" data-view="files" onclick="showView('files')">文件管理</button>
+    <button class="navbtn" data-view="sources" onclick="showView('sources')">来源机配置</button>
+  </div>
 
+  <div class="view active" id="view-overview">
+  <div class="card"><h2>资源管理</h2><div id="ovBox" class="tiny">加载中…</div></div>
+  </div>
+
+  <div class="view" id="view-sources">
   <div class="card"><h2>来源机关联配置</h2>
-    <div class="tiny" style="margin-bottom:8px">每行 = 一台来源机（dola-pool）。名称与 key 发给对方填入其面板「归档节点」即完成挂载；配额为该机可占用空间上限。</div>
+    <div class="tiny" style="margin-bottom:8px">每行 = 一台来源机（dola-pool）。名称与 key 发给对方填入其面板「归档节点」即完成挂载；配额为该机可占用空间上限，填 0 表示不限制（用满磁盘）。</div>
     <div id="srcRows"></div>
     <div class="row"><button class="btn" onclick="addSrc()">＋ 添加来源机</button>
     <button class="btn btn-p" onclick="saveSrc()">保存配置</button>
     <span id="srcMsg" class="msg tiny"></span></div></div>
+  </div>
 
+  <div class="view" id="view-files">
   <div class="card"><h2>文件管理</h2>
     <div class="row">
       <select id="srcSel" onchange="loadFiles(1)"></select>
@@ -586,6 +608,7 @@ th,td{padding:5px 5px}.hide-m{display:none}}
       <span id="fileMsg" class="msg tiny"></span></div>
     <div id="fileBox"></div>
     <div class="pager" id="pager"></div></div>
+  </div>
 </div>
 <script>
 let AK=localStorage.getItem('arch_ak')||'';
@@ -622,8 +645,8 @@ async function loadOverview(){
       <span>归档总量 <b>${fmtB(o.archive_bytes)}</b> · ${o.total_files} 个文件</span></div>
     <table><tr><th>来源机</th><th>文件数</th><th>占用/配额</th><th style="width:140px">配额使用</th><th class="hide-m">最近推送</th></tr>
     ${o.sources.map(s=>`<tr><td><b>${esc(s.name)}</b></td><td>${s.files}</td>
-      <td>${fmtB(s.usage_bytes)} / ${s.quota_mb} MB</td>
-      <td>${bar(s.usage_bytes,s.quota_mb*1048576)}</td>
+      <td>${fmtB(s.usage_bytes)} / ${s.quota_mb?s.quota_mb+' MB':'不限制'}</td>
+      <td>${bar(s.usage_bytes,s.quota_mb?s.quota_mb*1048576:o.disk.total)}</td>
       <td class="hide-m">${fmtT(s.last_push)}</td></tr>`).join('')||'<tr><td colspan="5" class="tiny">尚未登记来源机</td></tr>'}
     </table>`;
 }
@@ -634,7 +657,7 @@ async function loadSources(){
     <div class="row src-row">
       <input class="s-name" style="width:130px" placeholder="名称（如 A机）" value="${esc(s.name)}">
       <input class="s-key mono" style="flex:1;min-width:180px" placeholder="key" value="${esc(s.key)}">
-      <input class="s-quota" style="width:110px" placeholder="配额MB" value="${s.quota_mb||2048}">
+      <input class="s-quota" style="width:110px" placeholder="配额MB(0=不限)" value="${s.quota_mb??0}">
       <button class="btn btn-danger" onclick="this.parentElement.remove()">删除</button></div>`).join('')
     :'<div class="tiny" style="margin-bottom:8px">尚未登记来源机</div>';
   const opts=SRC.map(s=>`<option>${esc(s.name)}</option>`).join('');
@@ -644,14 +667,14 @@ async function loadSources(){
 function addSrc(){const div=document.createElement('div');div.className='row src-row';
   div.innerHTML=`<input class="s-name" style="width:130px" placeholder="名称（如 A机）">
     <input class="s-key mono" style="flex:1;min-width:180px" placeholder="key">
-    <input class="s-quota" style="width:110px" placeholder="配额MB" value="2048">
+    <input class="s-quota" style="width:110px" placeholder="配额MB(0=不限)" value="0">
     <button class="btn btn-danger" onclick="this.parentElement.remove()">删除</button>`;
   q('#srcRows').appendChild(div);}
 async function saveSrc(){
   const sources=[...q('#srcRows').querySelectorAll('.src-row')].map(r=>({
     name:r.querySelector('.s-name').value.trim(),
     key:r.querySelector('.s-key').value.trim(),
-    quota_mb:parseInt(r.querySelector('.s-quota').value)||2048
+    quota_mb:(n=>Number.isFinite(n)&&n>0?n:0)(parseInt(r.querySelector('.s-quota').value))
   })).filter(s=>s.name&&s.key);
   await api('/admin/api/sources',{method:'POST',body:{sources,admin_key:''}});
   const m=q('#srcMsg');m.textContent='已保存（写回 config.json，立即生效）';
@@ -684,11 +707,58 @@ async function clearSource(){
   const r=await api(`/admin/api/source/${encodeURIComponent(src)}/clear`,{method:'POST'});
   const m=q('#fileMsg');m.textContent=`已删除 ${r.deleted} 个文件`;
   setTimeout(()=>m.textContent='',4000);loadFiles(1);loadOverview();}
+function showView(name){
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+name));
+  document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
+  if(name==='files')loadFiles(curPage).catch(()=>{});
+}
 function boot(){loadOverview().catch(()=>{});loadSources().then(()=>loadFiles(1)).catch(()=>{});}
 if(AK){api('/admin/api/overview').then(()=>boot()).catch(()=>{});
   q('#akInput').addEventListener('change',saveKey);}
 else q('#loginMask').style.display='flex';
 </script></body></html>"""
+
+
+# ==================== 顶部系统菜单 + 服务器文件管理/资源监控 ====================
+
+SYS_NAV_CSS = """<style>
+.sysnav{display:flex;gap:4px;padding:8px 16px;background:#0d1116;border-bottom:1px solid #2a3342;
+flex-wrap:wrap}
+.sysnav a{color:#8a94a6;text-decoration:none;padding:6px 14px;border-radius:6px;
+font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.sysnav a:hover{color:#d7dde6;background:#1c2330}
+.sysnav a.on{color:#4a9eff;background:#1c2330}
+</style>"""
+
+
+def sys_nav(active: str) -> str:
+    items = [("admin", "归档机管理"), ("fm", "文件管理"), ("mon", "资源管理")]
+    links = ""
+    for k, name in items:
+        cls = ' class="on"' if k == active else ""
+        links += f'<a href="/{k}"{cls}>{name}</a>'
+    return SYS_NAV_CSS + f'<div class="sysnav">{links}</div>'
+
+
+def _page_with_nav(filename: str, active: str) -> str:
+    html = (WEB_DIR / filename).read_text(encoding="utf-8")
+    nav = sys_nav(active)
+    return html.replace("<body>", "<body>" + nav, 1) if "<body>" in html else nav + html
+
+
+@app.get("/fm", response_class=HTMLResponse)
+async def fm_page():
+    return _page_with_nav("fm.html", "fm")
+
+
+@app.get("/mon", response_class=HTMLResponse)
+async def mon_page():
+    return _page_with_nav("mon.html", "mon")
+
+
+from tools_api import router as tools_router  # noqa: E402
+
+app.include_router(tools_router)
 
 
 if __name__ == "__main__":

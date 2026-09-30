@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>资源监控</title>
+<style>
+:root{
+  --bg:#0f1419;--bg2:#161b22;--bg3:#1c2330;--bd:#2a3342;--fg:#d7dde6;--dim:#8a94a6;
+  --acc:#4a9eff;--ok:#3fb950;--warn:#d29922;--err:#f85149;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{max-width:100%;overflow-x:hidden}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh}
+button{background:var(--bg3);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:5px 12px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc);color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.btn-active{border-color:var(--acc);color:var(--acc)}
+input{background:var(--bg2);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 10px;font-size:13px;outline:none}
+input:focus{border-color:var(--acc)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--bd);background:var(--bg2);flex-wrap:wrap}
+header h1{font-size:16px;color:var(--acc);white-space:nowrap}
+.sysinfo{color:var(--dim);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;flex:1;min-width:0;word-break:break-all}
+.sysinfo b{color:var(--fg);font-weight:600}
+#updBtn{margin-left:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:14px 16px}
+.card{background:var(--bg2);border:1px solid var(--bd);border-radius:10px;padding:14px 16px}
+.card h3{font-size:13px;color:var(--dim);margin-bottom:10px;display:flex;justify-content:space-between;align-items:baseline}
+.card h3 .big{font-size:22px;color:var(--fg);font-family:ui-monospace,Consolas,monospace}
+canvas{width:100%;height:130px;display:block}
+.cores{display:flex;gap:4px;margin-top:10px;flex-wrap:wrap}
+.core{flex:1;min-width:26px;text-align:center;font-size:10px;color:var(--dim)}
+.core .bar{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin-top:3px}
+.core .bar i{display:block;height:100%;background:var(--acc);width:0%;transition:width .5s}
+.core.hot .bar i{background:var(--err)}
+.memline{margin-top:10px}
+.memline .lab{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin-bottom:4px}
+.memline .lab b{color:var(--fg);font-family:ui-monospace,Consolas,monospace;font-weight:500}
+.memline .track{height:10px;background:var(--bg3);border-radius:5px;overflow:hidden}
+.memline .track i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),#7ee787);transition:width .5s}
+.memline.swap .track i{background:var(--warn)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);padding:5px 8px;border-bottom:1px solid var(--bd);font-weight:600;position:sticky;top:0;background:var(--bg2)}
+td{padding:4px 8px;border-bottom:1px solid rgba(42,51,66,.4);white-space:nowrap}
+td.num{font-family:ui-monospace,Consolas,monospace;text-align:right}
+.pwrap{max-height:300px;overflow:auto;margin-top:8px}
+.legend{display:flex;gap:16px;font-size:11px;color:var(--dim);margin-top:6px;flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.diskrow{margin-bottom:10px}
+.diskrow .lab{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin-bottom:3px;font-family:ui-monospace,Consolas,monospace}
+.diskrow .lab b{color:var(--fg);font-weight:500}
+.diskrow .track{height:10px;background:var(--bg3);border-radius:5px;overflow:hidden}
+.diskrow .track i{display:block;height:100%;transition:width .5s}
+/* inset 兼容老移动浏览器：显式四边定位，弹性无导航条遮挡 */
+.overlay{position:fixed;top:0;right:0;bottom:0;left:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:100}
+.overlay.hidden{display:none}
+.login-box{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:32px;width:340px;max-width:calc(100vw - 32px)}
+.login-box h2{margin-bottom:6px;color:var(--acc)}
+.login-box p{color:var(--dim);font-size:12px;margin-bottom:18px}
+.login-box input{width:100%;margin-bottom:14px}
+.login-box button{width:100%}
+.login-err{color:var(--err);font-size:12px;min-height:16px;margin-bottom:8px}
+#toasts{position:fixed;right:16px;bottom:16px;z-index:300;display:flex;flex-direction:column;gap:8px;left:16px;pointer-events:none}
+.toast{background:var(--bg3);border:1px solid var(--bd);border-left:3px solid var(--acc);border-radius:8px;padding:10px 16px;font-size:13px;animation:slide .2s ease}
+.toast.err{border-left-color:var(--err)}
+@keyframes slide{from{transform:translateX(30px);opacity:0}to{transform:none;opacity:1}}
+
+.navlink{display:inline-flex;align-items:center;gap:5px;color:var(--dim);text-decoration:none;font-size:13px;border:1px solid var(--bd);border-radius:6px;padding:5px 12px;white-space:nowrap}
+.navlink:hover{color:var(--acc);border-color:var(--acc)}
+.card.clickable{cursor:pointer;transition:border-color .15s}
+.card.clickable:hover{border-color:var(--acc)}
+.card.clickable.sel{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
+.card.clickable h3::after{content:'▾';margin-left:6px;color:var(--dim);font-size:11px}
+.card.clickable.sel h3::after{content:'▴';color:var(--acc)}
+.detail-tbl{width:auto;min-width:560px;max-width:100%}
+.detail-tbl td,.detail-tbl th{padding-right:22px}
+.killbtn{background:transparent;border:1px solid transparent;color:var(--dim);border-radius:5px;padding:1px 7px;font-size:12px;line-height:1.4}
+.killbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.08)}
+@media (max-width:480px){
+  .grid{grid-template-columns:minmax(0,1fr);padding:10px;gap:10px}
+  header{padding:8px 10px;gap:6px}
+  header h1{font-size:15px}
+  .navlink{padding:4px 8px;font-size:12px}
+  /* 主机信息折到按钮行下方整行显示，保证 标题+dola+文件管理+暂停 一行放下 */
+  .sysinfo{order:9;flex-basis:100%;gap:4px 12px}
+  #updBtn{margin-left:0}
+  .card{padding:12px;min-width:0}
+  canvas{height:110px}
+  .detail-tbl{min-width:0}
+  .login-box{width:calc(100vw - 32px)}
+}
+</style>
+</head>
+<body>
+
+<div id="loginOverlay" class="overlay hidden">
+  <div class="login-box">
+    <h2>📊 资源监控</h2>
+    <p>请输入管理密码登录</p>
+    <input id="loginPwd" type="password" placeholder="管理密钥" autofocus>
+    <div class="login-err" id="loginErr"></div>
+    <button class="primary" id="loginBtn">登 录</button>
+  </div>
+</div>
+
+<header>
+  <h1>📊 资源监控</h1>
+  <div class="sysinfo" id="sysinfo"></div>
+  <a class="navlink" id="dolaLink" href="/">🤖 dola</a>
+  <a class="navlink" href="/fm.html">📁 文件管理</a>
+  <button id="updBtn">⏸ 暂停</button>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h3>CPU <span class="big" id="cpuBig">—%</span></h3>
+    <canvas id="cpuChart"></canvas>
+    <div class="legend"><span><i style="background:#4a9eff"></i>CPU 总体</span><span><i style="background:#7ee787"></i>内存占用</span><span id="histSpan"></span></div>
+    <div class="cores" id="cores"></div>
+    <div class="memline" style="margin-top:10px">
+      <div class="lab"><span>负载 1/5/15min</span><b id="loadVal">—</b></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>内存 / 交换分区 <span class="big" id="memBig">—%</span></h3>
+    <div class="memline">
+      <div class="lab"><span>内存</span><b id="memDetail">—</b></div>
+      <div class="track"><i id="memBar"></i></div>
+    </div>
+    <div class="memline swap">
+      <div class="lab"><span>Swap</span><b id="swapDetail">—</b></div>
+      <div class="track"><i id="swapBar"></i></div>
+    </div>
+    <div class="memline" style="opacity:.55">
+      <div class="lab"><span>内核 MemAvailable（弹性内存被宿主机占用，按需归还，仅参考）</span><b id="osAvail">—</b></div>
+    </div>
+    <canvas id="memChart" style="margin-top:14px"></canvas>
+  </div>
+  <div class="card clickable" id="netCard" onclick="selDetail('net')">
+    <h3>网络 <span class="big" id="netBig">—</span></h3>
+    <canvas id="netChart"></canvas>
+    <div class="legend"><span><i style="background:#3fb950"></i>↓ 下载</span><span><i style="background:#d29922"></i>↑ 上传</span><span id="netTotal"></span></div>
+  </div>
+  <div class="card clickable" id="ioCard" onclick="selDetail('disk')">
+    <h3>磁盘 IO <span class="big" id="ioBig">—</span></h3>
+    <canvas id="ioChart"></canvas>
+    <div class="legend"><span><i style="background:#bc8cff"></i>读</span><span><i style="background:#ffa198"></i>写</span></div>
+  </div>
+  <div class="card clickable" id="partCard" style="grid-column:1/-1" onclick="selDetail('disk')">
+    <h3>磁盘分区使用</h3>
+    <div id="diskList"></div>
+  </div>
+  <div class="card" id="detailCard" style="grid-column:1/-1;display:none">
+    <div id="detailBody"></div>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <h3>进程
+      <span>
+        <button id="byCpu" class="btn-active">按 CPU</button>
+        <button id="byMem">按内存</button>
+      </span>
+    </h3>
+    <div class="pwrap">
+      <table>
+        <thead><tr><th>PID</th><th>名称</th><th>用户</th><th>状态</th><th style="text-align:right">CPU%</th><th style="text-align:right">内存%</th><th style="text-align:right">RSS</th><th style="text-align:right">操作</th></tr></thead>
+        <tbody id="procBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let token = '';
+try{ token = localStorage.getItem('arch_ak') || ''; }catch(e){}
+let paused = false, sortBy = 'cpu', timer = null;
+let detailSel = null, lastStats = null, diskDirPath = '/';
+let scanCfg = {auto:true, interval:600};
+
+function saveToken(t){
+  token = t;
+  try{ localStorage.setItem('arch_ak', t); }catch(e){}
+}
+
+function toast(msg, type='ok'){
+  const d=document.createElement('div'); d.className='toast '+type; d.textContent=msg;
+  $('toasts').appendChild(d);
+  setTimeout(()=>{ d.style.opacity='0'; d.style.transition='opacity .3s'; setTimeout(()=>d.remove(),300); },2600);
+}
+async function api(path){
+  const r = await fetch(path,{headers:{'X-Admin-Key':token}});
+  if(r.status===401){ showLogin(); throw new Error('未登录'); }
+  if(!r.ok){ let e={}; try{e=await r.json();}catch(_){ } throw new Error(e.detail||('HTTP '+r.status)); }
+  return r.json();
+}
+function showLogin(){ $('loginOverlay').classList.remove('hidden'); try{$('loginPwd').focus();}catch(e){} }
+function fmtSize(n){
+  if(n==null) return '—';
+  const u=['B','KB','MB','GB','TB']; let i=0; n=Number(n)||0;
+  while(Math.abs(n)>=1024 && i<u.length-1){ n/=1024; i++; }
+  return (i===0? n : n.toFixed(1))+' '+u[i];
+}
+function fmtRate(n){ return fmtSize(n)+'/s'; }
+function fmtUptime(s){
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return (d? d+'天 ':'') + h+'小时' + m+'分';
+}
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,
+    c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function lineChart(cv, series, opts={}){
+  const dpr = window.devicePixelRatio||1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if(!w||!h) return;
+  cv.width = w*dpr; cv.height = h*dpr;
+  const ctx = cv.getContext('2d'); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  let max = opts.max;
+  if(max==null){
+    max = 1;
+    for(const s of series) for(const v of s.data) if(v>max) max=v;
+    max *= 1.15;
+  }
+  ctx.strokeStyle = 'rgba(42,51,66,.8)'; ctx.lineWidth = 1;
+  for(let i=0;i<=4;i++){
+    const y = h-4 - (h-8)*i/4;
+    ctx.beginPath(); ctx.moveTo(28,y); ctx.lineTo(w,y); ctx.stroke();
+    ctx.fillStyle = '#8a94a6'; ctx.font = '10px monospace';
+    const v = max*i/4;
+    ctx.fillText(opts.fmt? opts.fmt(v) : Math.round(v), 0, y+3);
+  }
+  const n = Math.max(...series.map(s=>s.data.length), 2);
+  for(const s of series){
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    s.data.forEach((v,i)=>{
+      const x = 30 + (w-32)*i/(n-1);
+      const y = h-4 - (h-8)*Math.min(v,max)/max;
+      i? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+    if(s.fill){
+      const last = s.data.length-1;
+      const x0 = 30, x1 = 30 + (w-32)*last/(n-1);
+      ctx.lineTo(x1, h-4); ctx.lineTo(x0, h-4); ctx.closePath();
+      ctx.globalAlpha = .12; ctx.fillStyle = s.color; ctx.fill(); ctx.globalAlpha = 1;
+    }
+  }
+}
+
+async function refresh(){
+  let d;
+  try{ d = await api('/api/stats'); }catch(e){ if(e.message!=='未登录') console.warn(e); return; }
+  const s = d.cur;
+  const sys = d.sys;
+  $('sysinfo').innerHTML =
+    `<span>主机 <b>${esc(sys.hostname)}</b></span>` +
+    `<span>${esc(sys.platform)} • ${sys.cpu_count} 核</span>` +
+    `<span>运行 <b>${fmtUptime(sys.uptime)}</b></span>` +
+    `<span>连接数 <b>${sys.nconn<0?'—':sys.nconn}</b></span>`;
+  if(!s) return;
+  $('cpuBig').textContent = s.cpu.toFixed(1)+'%';
+  $('cpuBig').style.color = s.cpu>85? 'var(--err)' : s.cpu>60? 'var(--warn)':'var(--fg)';
+  $('loadVal').textContent = s.load.join(' / ');
+  const H = d.hist;
+  $('histSpan').textContent = `近 ${Math.max(1, Math.round(H.ts.length/60))} 分钟`;
+  lineChart($('cpuChart'), [
+    {data:H.cpu, color:'#4a9eff', fill:true},
+    {data:H.mem, color:'#7ee787'},
+  ], {max:100, fmt:v=>Math.round(v)+'%'});
+
+  const coresEl = $('cores');
+  if(coresEl.childElementCount !== s.cores.length){
+    coresEl.innerHTML = s.cores.map((_,i)=>`<div class="core" id="core${i}"><div>${i}</div><div class="bar"><i></i></div></div>`).join('');
+  }
+  s.cores.forEach((v,i)=>{
+    const el = $('core'+i);
+    el.querySelector('i').style.width = v+'%';
+    el.classList.toggle('hot', v>85);
+  });
+
+  $('memBig').textContent = s.mem.pct.toFixed(1)+'%';
+  $('memDetail').textContent = `已用 ${fmtSize(s.mem.used)} / ${fmtSize(s.mem.total)}（真实可用 ${fmtSize(s.mem.avail)}）`;
+  $('memBar').style.width = s.mem.pct+'%';
+  $('osAvail').textContent = fmtSize(s.mem.os_avail);
+  $('swapDetail').textContent = s.mem.swap_total ? `${fmtSize(s.mem.swap_used)} / ${fmtSize(s.mem.swap_total)}` : '无 Swap';
+  $('swapBar').style.width = (s.mem.swap_pct||0)+'%';
+  lineChart($('memChart'), [{data:H.mem, color:'#7ee787', fill:true}], {max:100, fmt:v=>Math.round(v)+'%'});
+
+  const netMax = Math.max(...H.net_recv, ...H.net_sent, 1);
+  $('netBig').textContent = `↓${fmtRate(s.net_recv)} ↑${fmtRate(s.net_sent)}`;
+  $('netTotal').textContent = `累计 ↓${fmtSize(s.net_total_recv)} ↑${fmtSize(s.net_total_sent)}`;
+  lineChart($('netChart'), [
+    {data:H.net_recv, color:'#3fb950', fill:true},
+    {data:H.net_sent, color:'#d29922'},
+  ], {max:netMax, fmt:fmtSize});
+
+  $('ioBig').textContent = `读${fmtRate(s.disk_read)} 写${fmtRate(s.disk_write)}`;
+  const ioMax = Math.max(...H.disk_read, ...H.disk_write, 1);
+  lineChart($('ioChart'), [
+    {data:H.disk_read, color:'#bc8cff', fill:true},
+    {data:H.disk_write, color:'#ffa198'},
+  ], {max:ioMax, fmt:fmtSize});
+
+  $('diskList').innerHTML = d.disks.map(k=>{
+    const col = k.pct>90? 'var(--err)' : k.pct>75? 'var(--warn)':'var(--acc)';
+    return `<div class="diskrow">
+      <div class="lab"><span>${esc(k.mount)} <span style="opacity:.6">(${esc(k.dev)})</span></span><b>${fmtSize(k.used)} / ${fmtSize(k.total)} • ${k.pct}%</b></div>
+      <div class="track"><i style="width:${k.pct}%;background:${col}"></i></div>
+    </div>`;
+  }).join('') || '<span style="color:var(--dim)">无可用分区</span>';
+
+  const rows = sortBy==='cpu' ? d.top_cpu : d.top_mem;
+  $('procBody').innerHTML = rows.map(p=>`<tr>
+    <td class="num">${p.pid}</td><td title="${p.pid}">${esc(p.name)}</td><td>${esc(p.user)}</td><td>${esc(p.status)}</td>
+    <td class="num" style="color:${p.cpu>50?'var(--err)':'inherit'}">${p.cpu}</td>
+    <td class="num">${p.mem}</td>
+    <td class="num">${fmtSize(p.rss)}</td>
+    <td class="num"><button class="killbtn" title="终止进程 ${p.pid}" onclick="killProc(${p.pid})">✕ 终止</button></td></tr>`).join('');
+
+  lastStats = d;
+  renderDetail();
+  if(detailSel==='disk'){ updateDiskSummary(); refreshDiskUsage(); }
+}
+
+function selDetail(w){
+  detailSel = detailSel===w ? null : w;
+  $('netCard').classList.toggle('sel', detailSel==='net');
+  $('ioCard').classList.toggle('sel', detailSel==='disk');
+  $('partCard').classList.toggle('sel', detailSel==='disk');
+  renderDetail();
+}
+
+function netDetailHTML(){
+  const ifs = (lastStats && lastStats.net_ifs) || [];
+  if(!ifs.length) return '<span style="color:var(--dim)">暂无网卡数据</span>';
+  const rows = ifs.map(n=>{
+    const up = n.up==null ? '—'
+      : n.up ? '<span style="color:var(--ok)">已启用</span>' : '<span style="color:var(--dim)">停用</span>';
+    return `<tr><td>${esc(n.name)}</td><td>${up}</td><td>${esc(n.addr||'—')}</td>`+
+      `<td class="num">${n.speed? n.speed+' Mbps':'—'}</td>`+
+      `<td class="num" style="color:#3fb950">${fmtRate(n.recv)}</td>`+
+      `<td class="num" style="color:#d29922">${fmtRate(n.sent)}</td>`+
+      `<td class="num">${fmtSize(n.total_recv)}</td><td class="num">${fmtSize(n.total_sent)}</td></tr>`;
+  }).join('');
+  return `<div class="pwrap" style="max-height:240px"><table class="detail-tbl">
+    <thead><tr><th>接口</th><th>状态</th><th>IP 地址</th><th style="text-align:right">链路速率</th><th style="text-align:right">↓ 速率</th><th style="text-align:right">↑ 速率</th><th style="text-align:right">↓ 累计</th><th style="text-align:right">↑ 累计</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function diskDetailHTML(){
+  return `<div id="diskIoLine" style="margin:2px 0 10px;font-size:12px;color:var(--dim)"></div>`
+    + `<div id="diskPartBox"><span style="color:var(--dim)">加载中…</span></div>`
+    + `<div style="display:flex;align-items:center;gap:14px;margin:14px 0 8px;font-size:13px;flex-wrap:wrap">`
+    + `<b style="color:var(--fg);font-size:13px">目录占用明细</b>`
+    + `<label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:var(--dim)">`
+    + `<input type="checkbox" id="scanAutoChk" style="width:auto" onchange="saveScanCfg()">自动扫描</label>`
+    + `<span style="font-size:12px;color:var(--dim)">每 <input type="number" id="scanMinInput" min="1" max="1440" value="10" style="width:64px;padding:2px 6px" onchange="saveScanCfg()"> 分钟重扫一次（缓存期内不开新扫描）</span>`
+    + `<button style="padding:2px 10px;font-size:12px" onclick="rescanDisk()">↻ 重新扫描</button>`
+    + `</div><div id="diskUsageBox"><span style="color:var(--dim)">加载中…</span></div>`;
+}
+
+function updateDiskSummary(){
+  const s = (lastStats && lastStats.cur) || {};
+  const io = $('diskIoLine');
+  if(io) io.innerHTML = `磁盘 IO：读 <b style="color:var(--fg)">${fmtRate(s.disk_read||0)}</b> / 写 <b style="color:var(--fg)">${fmtRate(s.disk_write||0)}</b>　·　累计读 <b style="color:var(--fg)">${fmtSize(s.disk_total_read||0)}</b> / 累计写 <b style="color:var(--fg)">${fmtSize(s.disk_total_write||0)}</b>`;
+  const pb = $('diskPartBox');
+  if(!pb) return;
+  const rows = ((lastStats && lastStats.disks) || []).map(k=>{
+    const col = k.pct>90? 'var(--err)' : k.pct>75? 'var(--warn)':'var(--fg)';
+    return `<tr><td>${esc(k.mount)}</td><td>${esc(k.dev)}</td>`+
+      `<td class="num">${fmtSize(k.total)}</td><td class="num">${fmtSize(k.used)}</td><td class="num">${fmtSize(k.free)}</td>`+
+      `<td class="num" style="color:${col}">${k.pct}%</td></tr>`;
+  }).join('');
+  pb.innerHTML = `<div class="pwrap" style="max-height:200px"><table class="detail-tbl">
+    <thead><tr><th>挂载点</th><th>设备</th><th style="text-align:right">总量</th><th style="text-align:right">已用</th><th style="text-align:right">可用</th><th style="text-align:right">占比</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" style="color:var(--dim)">无可用分区</td></tr>'}</tbody></table></div>`;
+}
+
+let scanCfgLoading = false;
+async function loadScanCfg(){
+  if(scanCfgLoading) return;
+  scanCfgLoading = true;
+  try{
+    const r = await fetch('/api/disk/scan_config',{headers:{'X-Admin-Key':token}});
+    if(r.ok) scanCfg = await r.json();
+  }catch(e){ scanCfgLoading = false; return; }
+  scanCfgLoading = false;
+  const chk=$('scanAutoChk'), inp=$('scanMinInput');
+  if(chk) chk.checked = !!scanCfg.auto;
+  if(inp && document.activeElement!==inp) inp.value = Math.max(1, Math.round((scanCfg.interval||600)/60));
+}
+async function saveScanCfg(){
+  const chk=$('scanAutoChk'), inp=$('scanMinInput');
+  const body={};
+  if(chk) body.auto = chk.checked;
+  if(inp) body.interval = Math.max(1, Math.round(parseFloat(inp.value||'10')*60));
+  try{
+    const r = await fetch('/api/disk/scan_config',{method:'POST',
+      headers:{'X-Admin-Key':token,'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    if(!r.ok){ toast('保存失败','err'); return; }
+    scanCfg = await r.json();
+    toast('扫描设置已保存');
+  }catch(e){ toast(e.message,'err'); }
+}
+async function rescanDisk(){
+  try{
+    await fetch('/api/disk/usage?path='+encodeURIComponent(diskDirPath)+'&force=1',
+      {headers:{'X-Admin-Key':token}});
+    toast('已开始重新扫描');
+  }catch(e){}
+  refreshDiskUsage();
+}
+
+function renderDetail(){
+  const card = $('detailCard');
+  if(!detailSel){ card.style.display='none'; card.dataset.sel=''; return; }
+  if(card.style.display==='' && card.dataset.sel===detailSel) return;
+  card.style.display='';
+  card.dataset.sel=detailSel;
+  $('detailBody').innerHTML = detailSel==='net' ? netDetailHTML() : diskDetailHTML();
+  if(detailSel==='disk'){ updateDiskSummary(); loadScanCfg(); }
+}
+
+async function refreshDiskUsage(){
+  const box = document.getElementById('diskUsageBox');
+  if(!box || detailSel!=='disk') return;
+  let d;
+  try{
+    const r = await fetch('/api/disk/usage?path='+encodeURIComponent(diskDirPath),
+      {headers:{'X-Admin-Key':token}});
+    if(!r.ok){ box.innerHTML = '<span style="color:var(--dim)">目录占用获取失败</span>'; return; }
+    d = await r.json();
+  }catch(e){ return; }
+  if(d.scanning && !(d.dirs && d.dirs.length)){
+    box.innerHTML = '<span style="color:var(--dim)">⏳ 正在扫描目录大小（大目录需几十秒），自动刷新…</span>';
+    return;
+  }
+  const dirs = d.dirs || [];
+  const maxSz = Math.max(dirs.length? dirs[0].size : 1, 1);
+  const parent = diskDirPath.replace(/\/[^\/]*$/,'') || '/';
+  const nav = (diskDirPath!=='/')
+    ? `<button style="padding:1px 8px;font-size:12px;margin-right:8px" onclick="diskDrill('${parent.replace(/'/g,"\\'")}')">⬆ 上一级</button>` : '';
+  const head = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">${nav}`+
+    `<b style="color:var(--fg);font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all">${esc(diskDirPath)}</b>`+
+    (d.elapsed? `<span class="tiny" style="color:var(--dim)">扫描耗时 ${d.elapsed}s</span>`:'')+`</div>`;
+  const rows = dirs.slice(0,25).map(k=>{
+    if(!k.size) return '';
+    const pct = (k.size/maxSz*100).toFixed(1);
+    return `<tr style="cursor:pointer" onclick="diskDrill('${esc(k.path)}')">`+
+      `<td style="color:var(--acc);word-break:break-all">${esc(k.name)}/</td>`+
+      `<td style="width:32%;min-width:120px"><div class="track" style="height:8px"><i style="width:${pct}%"></i></div></td>`+
+      `<td class="num">${fmtSize(k.size)}</td></tr>`;
+  }).join('');
+  const rest = dirs.length>25? `<tr><td colspan="3" class="tiny" style="color:var(--dim)">其余 ${dirs.length-25} 个较小目录未列出</td></tr>`:'';
+  box.innerHTML = head + `<div class="pwrap" style="max-height:260px"><table class="detail-tbl">
+    <thead><tr><th>目录</th><th>相对大小</th><th style="text-align:right">大小</th></tr></thead>
+    <tbody>${rows}${rest || (!dirs.length? '<tr><td colspan="3" style="color:var(--dim)">无子目录</td></tr>':'')}</tbody></table></div>`;
+}
+
+function diskDrill(p){
+  diskDirPath = p;
+  const box = document.getElementById('diskUsageBox');
+  if(box) box.innerHTML = '<span style="color:var(--dim)">加载中…</span>';
+  refreshDiskUsage();
+}
+
+async function killProc(pid){
+  if(!confirm('确定终止进程 PID '+pid+' ？')) return;
+  try{
+    const r = await fetch('/api/kill',{method:'POST',
+      headers:{'X-Admin-Key':token,'Content-Type':'application/json'},
+      body:JSON.stringify({pid:pid})});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){ toast(d.detail||('HTTP '+r.status),'err'); return; }
+    toast('进程 '+pid+' 已终止（'+d.mode+'）');
+    setTimeout(refresh, 300);
+  }catch(e){ toast(e.message,'err'); }
+}
+
+function startTimer(){
+  clearInterval(timer);
+  refresh();
+  timer = setInterval(()=>{ if(!paused) refresh(); }, 2000);
+}
+$('updBtn').onclick = ()=>{
+  paused = !paused;
+  $('updBtn').textContent = paused ? '▶ 继续' : '⏸ 暂停';
+  $('updBtn').classList.toggle('btn-active', paused);
+};
+$('byCpu').onclick = ()=>{ sortBy='cpu'; $('byCpu').classList.add('btn-active'); $('byMem').classList.remove('btn-active'); refresh(); };
+$('byMem').onclick = ()=>{ sortBy='mem'; $('byMem').classList.add('btn-active'); $('byCpu').classList.remove('btn-active'); refresh(); };
+window.addEventListener('resize', ()=>{ if(!paused) refresh(); });
+
+$('loginBtn').onclick = doLogin;
+$('loginPwd').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+async function doLogin(){
+  $('loginErr').textContent='';
+  try{
+    const r = await fetch('/api/stats',{headers:{'X-Admin-Key':$('loginPwd').value}});
+    if(r.status===401){ $('loginErr').textContent='管理密钥错误'; return; }
+    if(!r.ok){ $('loginErr').textContent='HTTP '+r.status; return; }
+    saveToken($('loginPwd').value);
+    $('loginOverlay').classList.add('hidden');
+    if(!timer) startTimer(); else refresh();
+  }catch(e){ $('loginErr').textContent = e.message; }
+}
+
+/* 已并入 dola 程序：所有链接同源直连 */
+(function(){
+  const a = document.getElementById('dolaLink');
+  if(a) a.href = '/';
+})();
+
+/* 启动：无论有无令牌都开轮询——未登录时每轮 401 会拉起登录框，
+   登录成功后下一轮自动出数据；避免任何一步异常导致页面永远空置 */
+(function init(){
+  if(!token) showLogin();
+  startTimer();
+})();
+</script>
+<script>
+</script>
+</body>
+</html>

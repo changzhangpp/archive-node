@@ -1,0 +1,8 @@
+config.json
+archive.db
+data/
+monitor.log
+__pycache__/
+*.pyc
+server.log
+C机职责说明.md

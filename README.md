@@ -6,7 +6,8 @@
 
 ```bash
 # 1. 拉代码（仓库私有，需 GitHub PAT）
-git clone -b archive-node --depth 1 https://github.com/changzhangpp/dola-poolmanage.git archive-node
+#    注：早期文档指向 dola-poolmanage 的 archive-node 分支；本仓库现已独立为下方地址
+git clone -b main --depth 1 https://github.com/changzhangpp/archive-node.git archive-node
 cd archive-node
 
 # 2. 启动（首次自动生成 config.json，日志打印随机 admin_key）

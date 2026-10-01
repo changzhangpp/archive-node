@@ -40,7 +40,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930g"
+VERSION = "20260930h"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -957,8 +957,15 @@ app.include_router(tools_router)
 
 
 if __name__ == "__main__":
+    import socket as _socket
     import uvicorn
     cfg = load_config()
-    uvicorn.run(app, host=cfg.get("listen_host", "0.0.0.0"),
-                port=int(cfg.get("listen_port", 8100)),
-                access_log=False)
+    host = cfg.get("listen_host", "0.0.0.0")
+    port = int(cfg.get("listen_port", 8100))
+    # 自绑 socket 并开 SO_REUSEPORT：升级时新旧实例并行监听同一端口，零停机交接
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.setsockopt(_socket.SOL_SOCKET, getattr(_socket, "SO_REUSEPORT", 15), 1)
+    sock.bind((host, port))
+    sock.listen(2048)
+    uvicorn.run(app, host=host, port=port, fd=sock.fileno(), access_log=False)

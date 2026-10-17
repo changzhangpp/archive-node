@@ -1,7 +1,7 @@
 #!/bin/bash
 # archive-node availability monitor: dual probe every 30s, log state changes + hourly heartbeat
 cd "$(dirname "$0")" || exit 1
-EXT_URL="https://8100-6050e879a6f9affc.monkeycode-ai.online/health"
+EXT_URL="https://8100-572cc49902f2ee46.monkeycode-ai.live/health"
 LOG=monitor.log
 prev=""
 n=0

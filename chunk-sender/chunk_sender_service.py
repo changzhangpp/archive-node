@@ -6,9 +6,12 @@
 
   GET  /health                      服务与上游状态
   GET  /whoami                      校验归档 key，返回来源机名
+  GET  /list?source=                归档清单
+  GET  /stats                       占用统计
+  GET  /fetch?fname=&source=        回源下载（响应体为文件原始字节）
   POST /send?fname=..&task_id=..    请求体为文件原始字节，执行分片发送
 
-鉴权：设置 SERVICE_TOKEN 后，/whoami 与 /send 需带
+鉴权：设置 SERVICE_TOKEN 后，除 /health 外的接口需带
       X-Service-Token: <token> 或 Authorization: Bearer <token>。
 """
 
@@ -87,6 +90,57 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, SENDER.whoami())
             except SendError as exc:
                 return self._json(exc.status or 502, {"ok": False, "error": str(exc)})
+
+        if path == "/list":
+            if not self._auth_ok():
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                return self._json(200, SENDER.list_files(_first(q, "source") or None))
+            except SendError as exc:
+                return self._json(exc.status or 502, {"ok": False, "error": str(exc)})
+
+        if path == "/stats":
+            if not self._auth_ok():
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            try:
+                return self._json(200, SENDER.stats())
+            except SendError as exc:
+                return self._json(exc.status or 502, {"ok": False, "error": str(exc)})
+
+        if path == "/fetch":
+            if not self._auth_ok():
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            q = parse_qs(urlparse(self.path).query)
+            fname = _first(q, "fname")
+            if not fname:
+                return self._json(400, {"ok": False, "error": "缺少 fname"})
+            source = _first(q, "source") or None
+            try:
+                resp, meta = SENDER.open_file(fname, source)
+            except SendError as exc:
+                return self._json(exc.status or 502, {"ok": False, "error": str(exc)})
+            try:
+                self.send_response(getattr(resp, "status", 200))
+                self.send_header("Content-Type",
+                                 resp.headers.get("Content-Type", "application/octet-stream"))
+                length = resp.headers.get("Content-Length")
+                if length:
+                    self.send_header("Content-Length", length)
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{meta["fname"]}"')
+                self.end_headers()
+                while True:
+                    block = resp.read(READ_BLOCK)
+                    if not block:
+                        break
+                    self.wfile.write(block)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                resp.close()
+            return
+
         return self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):

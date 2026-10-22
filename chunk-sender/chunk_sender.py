@@ -6,7 +6,8 @@
   GET  /archive/push_status  查询已收片序号（断点续传）
   POST /archive/push_commit  按序号拼装 -> 整体 sha256 校验 -> 落盘记账
 
-职责：计算文件 size/sha256 -> 规划分片 -> 补传缺失片 -> 提交校验。
+职责：发送侧——计算文件 size/sha256 -> 规划分片 -> 补传缺失片 -> 提交校验；
+取回侧——回源下载（清单校验、断点续传、sha256 校验）。
 既可作为库被 import，也可作为 CLI（python -m chunk_sender）。
 """
 
@@ -204,6 +205,154 @@ class ArchiveSender:
             raise SendError(f"commit 回执 sha256 不一致: {got} != {sha256}")
         return res
 
+    # ---------- 取回 ----------
+    def list_files(self, source: Optional[str] = None) -> dict:
+        """列出某来源机的归档清单（默认当前 key 对应来源机）。"""
+        src = source or self.whoami().get("source")
+        return self._request("GET", f"/archive/list/{urllib.parse.quote(src, safe='')}")
+
+    def stats(self) -> dict:
+        """归档占用统计（按来源机）。"""
+        return self._request("GET", "/archive/stats")
+
+    def open_file(self, fname: str, source: Optional[str] = None,
+                  headers: Optional[dict] = None):
+        """打开回源下载流，返回 (响应对象, 元信息)。调用方负责 close()。"""
+        src = source or self.whoami().get("source")
+        fname = Path(fname).name
+        if not fname or fname.startswith("."):
+            raise SendError(f"非法 fname: {fname}")
+        path = (f"/archive/file/{urllib.parse.quote(src, safe='')}/"
+                f"{urllib.parse.quote(fname, safe='')}")
+        hdrs = {"X-Archive-Key": self.cfg.key, "User-Agent": self.cfg.user_agent,
+                "Accept": "*/*"}
+        if headers:
+            hdrs.update(headers)
+        req = urllib.request.Request(self._url(path), headers=hdrs, method="GET")
+        try:
+            resp = self._open(req)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            raise SendError(f"GET {path} -> HTTP {exc.code}: {raw[:300]}",
+                            status=exc.code, body=raw)
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
+            raise SendError(f"GET {path} 网络错误: {exc}")
+        return resp, {"source": src, "fname": fname}
+
+    @staticmethod
+    def _verify_file(path: Path, size: Optional[int], sha256: Optional[str],
+                     verify: bool):
+        got_size, got_sha = scan_file(path)
+        if size is not None and got_size != size:
+            return False, got_size, got_sha
+        if verify and sha256 and got_sha != sha256:
+            return False, got_size, got_sha
+        return True, got_size, got_sha
+
+    def _download_to(self, part: Path, src: str, fname: str, size: Optional[int],
+                     resume: bool, on_progress=None) -> int:
+        offset = part.stat().st_size if (resume and part.exists()) else 0
+        if size is not None and offset > size:
+            offset = 0
+        if size is not None and offset == size:
+            return offset
+
+        headers = {"Range": f"bytes={offset}-"} if offset > 0 else None
+        resp, _meta = self.open_file(fname, src, headers=headers)
+        try:
+            status = getattr(resp, "status", 200)
+            if offset > 0 and status != 206:
+                offset = 0  # 服务端未按 Range 返回，改为整文件重下
+            with open(part, "ab" if offset else "wb") as f:
+                done = offset
+                while True:
+                    block = resp.read(READ_BLOCK)
+                    if not block:
+                        break
+                    f.write(block)
+                    done += len(block)
+                    if on_progress:
+                        on_progress(done, size)
+            return offset
+        finally:
+            resp.close()
+
+    def fetch(self, fname: str, dest=None, source: Optional[str] = None,
+              verify: bool = True, resume: bool = True, overwrite: bool = False,
+              on_progress: Optional[Callable[[int, Optional[int]], None]] = None) -> dict:
+        """从归档机取回文件（回源）。
+
+        默认校验清单中的 size/sha256；resume=True 时用 `.part` 续传。
+        dest 为目录时自动拼接 fname；已存在且内容正确则跳过。
+        """
+        src = source or self.whoami().get("source")
+        fname = Path(fname).name
+        if not fname or fname.startswith("."):
+            raise SendError(f"非法 fname: {fname}")
+        dest = Path(dest) if dest else Path(fname)
+        if dest.is_dir():
+            dest = dest / fname
+
+        size = sha = mtime = None
+        if verify:
+            listing = self.list_files(src)
+            meta = next((f for f in listing.get("files", [])
+                         if f.get("fname") == fname), None)
+            if not meta:
+                raise SendError(f"清单中无此文件: {src}/{fname}")
+            if meta.get("size") is not None:
+                size = int(meta["size"])
+            sha = meta.get("sha256")
+            mtime = meta.get("mtime") or None
+
+        if dest.exists():
+            if verify and size is not None and dest.stat().st_size == size:
+                if scan_file(dest)[1] == sha:
+                    return {"ok": True, "skipped": True, "source": src, "fname": fname,
+                            "dest": str(dest), "size": size, "sha256": sha,
+                            "verified": True, "resumed_bytes": 0}
+            if not overwrite:
+                raise SendError(f"目标已存在（--overwrite 覆盖）: {dest}")
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_suffix(dest.suffix + ".part")
+        resumed = 0
+        attempts = self.cfg.retries + 1
+        for attempt in range(attempts):
+            try:
+                resumed = self._download_to(part, src, fname, size, resume, on_progress)
+                break
+            except SendError as exc:
+                fatal = exc.status and 400 <= exc.status < 500 and exc.status not in (408, 429)
+                if fatal or attempt == attempts - 1:
+                    raise
+                self._sleep(attempt)
+
+        ok, got_size, got_sha = self._verify_file(part, size, sha, verify)
+        if not ok and resumed > 0:
+            # 续传前缀不可信时，整文件重下一次
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            resumed = self._download_to(part, src, fname, size, False, on_progress)
+            ok, got_size, got_sha = self._verify_file(part, size, sha, verify)
+        if not ok:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            raise SendError(f"校验失败: size={got_size} sha256={got_sha[:16]} "
+                            f"(期望 size={size} sha256={(sha or '')[:16]})")
+
+        os.replace(part, dest)
+        if mtime:
+            ts = int(mtime)
+            os.utime(dest, (ts, ts))
+        return {"ok": True, "skipped": False, "source": src, "fname": fname,
+                "dest": str(dest), "size": got_size, "sha256": got_sha,
+                "verified": bool(verify), "resumed_bytes": resumed}
+
     # ---------- 发送 ----------
     def send(self, path, fname: Optional[str] = None, task_id: str = "",
              mtime: Optional[int] = None, chunk_size: Optional[int] = None,
@@ -343,7 +492,64 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--no-recursive", action="store_true")
     d.add_argument("--task-id", default="")
     d.add_argument("--dry-run", action="store_true")
+
+    ls = sub.add_parser("list", help="列出归档清单")
+    ls.add_argument("--source", help="来源机名（默认当前 key 对应来源机）")
+
+    sub.add_parser("stats", help="查看归档占用统计")
+
+    f = sub.add_parser("fetch", help="从归档机取回文件（回源）")
+    f.add_argument("fname")
+    f.add_argument("--dest", help="保存路径或目录（默认当前目录/同名）")
+    f.add_argument("--source", help="来源机名（默认当前 key 对应来源机）")
+    f.add_argument("--no-verify", action="store_true", help="不校验清单 size/sha256")
+    f.add_argument("--no-resume", action="store_true", help="不使用 .part 续传")
+    f.add_argument("--overwrite", action="store_true", help="覆盖已存在文件")
+
+    fa = sub.add_parser("fetch-all", help="取回该来源机全部归档")
+    fa.add_argument("--dest-dir", default=".", help="保存目录（默认当前目录）")
+    fa.add_argument("--source", help="来源机名（默认当前 key 对应来源机）")
+    fa.add_argument("--no-verify", action="store_true")
+    fa.add_argument("--overwrite", action="store_true")
     return p
+
+
+def _fmt_ts(ts) -> str:
+    if not ts:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+
+
+def _hsize(n) -> str:
+    value = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)}B" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TB"
+
+
+def _print_fetch(res: dict) -> None:
+    if res.get("skipped"):
+        print(f"  已存在且校验一致，跳过: {res['dest']}")
+    else:
+        print(f"  取回: {res['fname']} -> {res['dest']} ({res['size']}B, "
+              f"sha256={res['sha256'][:16]}, 续传={res['resumed_bytes']}B, "
+              f"校验={res['verified']})")
+
+
+def _make_download_progress():
+    state = {"last": 0.0}
+
+    def cb(done: int, total) -> None:
+        now = time.time()
+        if now - state["last"] >= 0.5 or (total and done >= total):
+            state["last"] = now
+            pct = f" {done * 100 // total}%" if total else ""
+            sys.stderr.write(f"\r  下载 {done}B{pct}")
+            sys.stderr.flush()
+
+    return cb
 
 
 def main(argv=None) -> int:
@@ -368,6 +574,60 @@ def main(argv=None) -> int:
                 print(json.dumps(res, ensure_ascii=False, indent=2))
             else:
                 print(f"来源机: {res.get('source')}  (归档机版本 {res.get('version')})")
+            return 0
+
+        if args.cmd == "list":
+            res = sender.list_files(args.source or None)
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                files = res.get("files", [])
+                print(f"来源机 {res.get('source')}：{res.get('count', len(files))} 件")
+                for f in files:
+                    print(f"  {f.get('fname')}  {f.get('size')}B  "
+                          f"mtime={_fmt_ts(f.get('mtime'))}  "
+                          f"pushed={_fmt_ts(f.get('pushed_at'))}")
+            return 0
+
+        if args.cmd == "stats":
+            res = sender.stats()
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                for s in res.get("sources", []):
+                    print(f"  {s.get('name')}: {s.get('files')} 件, "
+                          f"{_hsize(s.get('usage_bytes'))} / {_hsize(s.get('quota_bytes'))}")
+            return 0
+
+        if args.cmd == "fetch":
+            cb = None if args.json else _make_download_progress()
+            res = sender.fetch(args.fname, dest=args.dest, source=args.source,
+                               verify=not args.no_verify, resume=not args.no_resume,
+                               overwrite=args.overwrite, on_progress=cb)
+            if cb:
+                sys.stderr.write("\n")
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                _print_fetch(res)
+            return 0
+
+        if args.cmd == "fetch-all":
+            listing = sender.list_files(args.source or None)
+            cb = None if args.json else _make_download_progress()
+            out = []
+            for f in listing.get("files", []):
+                res = sender.fetch(f["fname"], dest=args.dest_dir, source=args.source,
+                                   verify=not args.no_verify,
+                                   overwrite=args.overwrite, on_progress=cb)
+                if cb:
+                    sys.stderr.write("\n")
+                out.append(res)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            else:
+                for res in out:
+                    _print_fetch(res)
             return 0
 
         progress = None if args.json else _make_progress()

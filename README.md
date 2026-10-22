@@ -38,13 +38,20 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 
 ## 分片发送组件（chunk-sender）
 
-`chunk-sender/` 是独立可部署的分片发送组件（零第三方依赖，支持 CLI / Python 库 / HTTP 微服务 / Docker），
-用于来源机把大文件切片后推送归档，支持断点续传、自动重试与整体 sha256 校验。用法见 `chunk-sender/README.md`。
+`chunk-sender/` 是独立可部署的分片组件（零第三方依赖，支持 CLI / Python 库 / HTTP 微服务 / Docker），
+用于来源机把大文件切片后推送归档，或按清单取回（回源），支持断点续传、自动重试与整体 sha256 校验。
+用法见 `chunk-sender/README.md`。
 
 ```bash
 cd chunk-sender
-ARCHIVE_URL=https://8100-572cc49902f2ee46.monkeycode-ai.live ARCHIVE_KEY=<来源机key> \
-  python3 chunk_sender.py send ./big.mp4 --task-id job-1
+export ARCHIVE_URL=https://8100-572cc49902f2ee46.monkeycode-ai.live ARCHIVE_KEY=<来源机key>
+
+# 发送
+python3 chunk_sender.py send ./big.mp4 --task-id job-1
+
+# 取回（清单 -> 下载校验）
+python3 chunk_sender.py list
+python3 chunk_sender.py fetch big.mp4 --dest ./restore/
 ```
 
 ## 协议（供排障）

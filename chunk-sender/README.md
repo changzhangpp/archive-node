@@ -3,7 +3,9 @@
 把 archive-node 的「分片上传」能力抽成独立组件，可单独部署在任意来源机（A/B/其他系统）上，
 把本机要归档的内容切成分片后推送到归档机。零第三方依赖，Python 3.8+。
 
-- 作为 **CLI**：`archive-send send <文件>`
+- 发送：`send` / `send-dir`（分片上传）
+- 取回：`list` / `stats` / `fetch` / `fetch-all`（回源下载、校验、续传）
+- 作为 **CLI**：`archive-send send|fetch ...`
 - 作为 **库**：`from chunk_sender import ArchiveSender, SenderConfig`
 - 作为 **HTTP 微服务**：`chunk_sender_service.py`，供非 Python 系统调用
 - 作为 **容器**：自带 `Dockerfile`
@@ -40,6 +42,21 @@ graph LR
 - `mtime`：源文件修改时间（秒级 epoch），归档机落盘后回填，便于保留原始时间。
 - 空文件：上传 1 个 0 字节分片，commit `size=0`，服务端可正常拼装记账。
 
+### 取回逻辑
+
+| 步骤 | 接口 | 说明 |
+|---|---|---|
+| 1. 清单 | `GET /archive/list/{source}` | 取回前读取 `size`/`sha256`/`mtime` 作为校验基准 |
+| 2. 下载 | `GET /archive/file/{source}/{fname}` | 流式回源；支持 `Range` 时用 `.part` 断点续传 |
+| 3. 校验 | 本地 | 按清单校验 `size` 与整体 `sha256` |
+| 4. 落位 | 本地 | 校验通过后 `.part` 原子改名；按清单回填 `mtime` |
+| 5. 统计 | `GET /archive/stats` | 查看各来源机占用 |
+
+- **来源隔离**：key 只能访问其登记来源机的文件，跨来源返回 403。
+- **安全覆盖**：目标已存在且校验一致时跳过；不一致需显式 `--overwrite`。
+- **续传**：下载中断留下的 `<dest>.part` 在下次 `fetch` 时自动续传，完成后整体复校。
+- **回源留痕**：归档机对每次取回记 `audit_log`（action=fetch）。
+
 ## 快速开始
 
 ```bash
@@ -58,6 +75,12 @@ python3 chunk_sender.py send ./big.mp4 --task-id job-20261021
 
 # 5) 批量发送目录
 python3 chunk_sender.py send-dir ./exports --pattern "*.mp4"
+
+# 6) 取回：先看清单/统计，再下载（默认校验 sha256，支持 .part 续传）
+python3 chunk_sender.py list
+python3 chunk_sender.py stats
+python3 chunk_sender.py fetch big.mp4 --dest ./restore/
+python3 chunk_sender.py fetch-all --dest-dir ./restore/
 ```
 
 也可以 `python3 -m chunk_sender ...`（把本目录加入 `PYTHONPATH`），或安装后使用 `archive-send`：
@@ -106,6 +129,18 @@ curl -s -X POST \
 可选查询参数：`chunk_size`、`upload_id`（续传）、`resume=0`、`mtime`。
 服务端返回归档机的 commit 结果（`ok/sha256/size/dedup/usage_bytes` 等）。
 
+取回相关接口（同样需鉴权）：
+
+```bash
+# 清单 / 统计
+curl -s -H "X-Service-Token: <token>" http://127.0.0.1:8089/list
+curl -s -H "X-Service-Token: <token>" http://127.0.0.1:8089/stats
+
+# 回源下载（响应体即文件字节）
+curl -s -H "X-Service-Token: <token>" -OJ \
+  "http://127.0.0.1:8089/fetch?fname=big.mp4"
+```
+
 ## 容器部署
 
 ```bash
@@ -117,11 +152,12 @@ docker run --rm -p 8089:8089 \
 
 ## 断点续传与失败恢复
 
-- 单次运行内：先 `push_status`，只补缺失片；网络中断后重跑即可继续。
+- 发送：单次运行内先 `push_status`，只补缺失片；网络中断后重跑即可继续。
 - 跨进程/跨机器：显式传同一个 `--upload-id`（需与首次相同且 `fname` 一致），组件会查缺补片。
   未传时每次生成新 id，等价于全新上传。
 - 分片与提交均幂等：`push_chunk` 同 seq 覆盖，`push_commit` 按 (source,fname) 幂等 upsert。
 - 归档机对超过 24h 未 commit 的暂存分片会自动清理，超期后重跑会从头补片。
+- 取回：下载中断后保留 `<dest>.part`，重跑 `fetch` 自动 `Range` 续传，完成后整体 sha256 复校。
 - 5xx/429/网络错误自动重试；4xx（鉴权失败、参数错误、配额不足）直接失败并返回原因。
 
 ## 安全
@@ -130,6 +166,7 @@ docker run --rm -p 8089:8089 \
 - `ARCHIVE_KEY` 是**来源机 key**（由归档机管理台为每台来源机分配），不是管理台 `admin_key`。
 - 生产使用 HTTPS；仅在受信任内网才考虑 `ARCHIVE_VERIFY_TLS=0`。
 - HTTP 微服务务必设置 `SERVICE_TOKEN`，并限制在内网/白名单访问。
+- 取回同样受来源隔离约束：key 只能读本来源机文件；跨来源请求由归档机返回 403。
 
 ## 兼容性
 
@@ -144,4 +181,5 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试使用本地 mock 归档机，覆盖：整体往返、断点续传跳片、5xx 重试、空文件、dry-run、
-非法文件名与分片大小边界。
+非法文件名与分片大小边界；取回侧覆盖清单、往返下载、已存在跳过、Range 续传、
+sha256 校验失败与 overwrite 保护。

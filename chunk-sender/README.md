@@ -57,6 +57,7 @@ graph LR
 - **续传**：下载中断留下的 `<dest>.part` 在下次 `fetch` 时自动续传，完成后整体复校。
 - **回源留痕**：归档机对每次取回记 `audit_log`（action=fetch）。
 - **在线预览**：归档机提供 `GET /archive/preview/{source}/{fname}`（inline、支持 Range），管理台「文件管理」内置预览；程序侧可用来源机 key 访问，浏览器请用管理台或短期 token。
+- **分片合并预览**：上传中途（未 commit）也可在管理台「文件管理」下方「未完成分片」中合并预览；归档机按序合并到 `data/_preview/`，24h 未再预览自动清理，commit 后立即清理。
 
 ## 快速开始
 

@@ -33,6 +33,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -45,7 +46,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20261021a"
+VERSION = "20261022a"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -149,6 +150,165 @@ def valid_preview_token(source: str, fname: str, token: str | None) -> bool:
     if exp < int(time.time()):
         return False
     return hmac.compare_digest(sig, _preview_sign(source, fname, exp))
+
+# ---------- 分片合并预览（未 commit 暂存） ----------
+PREVIEW_CACHE_TTL = 24 * 3600
+_PREVIEW_LAST_CLEAN = 0.0
+_MERGE_LOCKS: dict = {}
+_MERGE_GUARD = threading.Lock()
+
+
+def _chunk_meta_path(d: Path) -> Path:
+    return d / "_meta.json"
+
+
+def _write_chunk_meta(d: Path, fname: str) -> None:
+    p = _chunk_meta_path(d)
+    now = int(time.time())
+    meta = {}
+    try:
+        if p.is_file():
+            meta = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    meta["fname"] = fname
+    meta.setdefault("created", now)
+    meta["updated"] = now
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _read_chunk_meta(d: Path) -> dict:
+    try:
+        return json.loads(_chunk_meta_path(d).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _pending_upload_parts(d: Path) -> list:
+    if not d.is_dir():
+        return []
+    return sorted(int(p.stem) for p in d.glob("*.part") if p.stem.isdigit())
+
+
+def _list_pending_uploads(source: str) -> list:
+    base = DATA_DIR / "_tmp" / Path(source).name
+    out = []
+    if not base.is_dir():
+        return out
+    for d in sorted(base.iterdir()):
+        if not d.is_dir():
+            continue
+        parts = _pending_upload_parts(d)
+        if not parts:
+            continue
+        meta = _read_chunk_meta(d)
+        size = 0
+        for seq in parts:
+            try:
+                size += (d / f"{seq:06d}.part").stat().st_size
+            except OSError:
+                pass
+        fname = meta.get("fname") or ""
+        out.append({
+            "upload_id": d.name,
+            "fname": fname,
+            "parts": len(parts),
+            "size": size,
+            "updated_at": int(d.stat().st_mtime),
+            "previewable": bool(fname and is_previewable(fname)),
+        })
+    return out
+
+
+def _chunk_fingerprint(d: Path, parts: list) -> str:
+    size = 0
+    newest = 0
+    for seq in parts:
+        try:
+            st = (d / f"{seq:06d}.part").stat()
+        except OSError:
+            continue
+        size += st.st_size
+        newest = max(newest, int(st.st_mtime))
+    return f"{len(parts)}-{parts[-1]:06d}-{size}-{newest}"
+
+
+def _merge_chunks(source: str, upload_id: str):
+    """把暂存分片按序合并为预览缓存，返回 (缓存路径, 文件名, 片数)。"""
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(400, "bad upload_id")
+    src_dir = DATA_DIR / "_tmp" / Path(source).name / upload_id
+    if not _pending_upload_parts(src_dir):
+        raise HTTPException(404, "no chunks uploaded")
+    key = (Path(source).name, upload_id)
+    with _MERGE_GUARD:
+        lock = _MERGE_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        parts = _pending_upload_parts(src_dir)
+        if not parts:
+            raise HTTPException(404, "no chunks uploaded")
+        fingerprint = _chunk_fingerprint(src_dir, parts)
+        out_dir = DATA_DIR / "_preview" / Path(source).name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"{upload_id}.{fingerprint}.merged"
+        if not target.is_file():
+            tmp = target.with_suffix(".merged.tmp")
+            with open(tmp, "wb") as out:
+                for seq in parts:
+                    with open(src_dir / f"{seq:06d}.part", "rb") as f:
+                        shutil.copyfileobj(f, out, 1024 * 1024)
+            os.replace(tmp, target)
+        now = time.time()
+        os.utime(target, (now, now))  # 最近一次预览时间（清理 TTL 依据）
+    meta = _read_chunk_meta(src_dir)
+    return target, meta.get("fname", ""), len(parts)
+
+
+def _remove_chunk_previews(source: str, upload_id: str) -> None:
+    d = DATA_DIR / "_preview" / Path(source).name
+    if not d.is_dir():
+        return
+    for f in d.glob(f"{upload_id}.*.merged"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def cleanup_preview_cache(ttl: int = PREVIEW_CACHE_TTL, force: bool = False) -> int:
+    """删除超过 ttl 秒未再预览的合并缓存，返回删除数量。"""
+    global _PREVIEW_LAST_CLEAN
+    now = time.time()
+    if not force and now - _PREVIEW_LAST_CLEAN < 600:
+        return 0
+    _PREVIEW_LAST_CLEAN = now
+    base = DATA_DIR / "_preview"
+    if not base.is_dir():
+        return 0
+    cutoff = now - ttl
+    removed = 0
+    for d in list(base.iterdir()):
+        if not d.is_dir():
+            continue
+        for f in list(d.glob("*.merged")):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        try:
+            if not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+    return removed
+
 
 
 
@@ -339,6 +499,7 @@ async def archive_push_chunk(request: Request,
         raise HTTPException(400, "bad seq")
     d = _chunk_tmp_dir(source, upload_id, create=True)
     _cleanup_stale_uploads(source)
+    _write_chunk_meta(d, fname)
     part = d / f"{seq:06d}.part"
     tmp = part.with_suffix(".part.tmp")
     n = 0
@@ -415,6 +576,7 @@ async def archive_push_commit(fname: str, upload_id: str, size: int, sha256: str
             tmp.rename(target)
         shutil.rmtree(d, ignore_errors=True)
         CHUNK_LOCKS.pop(upload_id, None)
+    _remove_chunk_previews(source, upload_id)
     now = int(time.time())
     conn = db()
     conn.execute("""INSERT INTO archive_files(source,fname,sha256,size,mtime,task_id,pushed_at)
@@ -599,6 +761,87 @@ async def archive_preview(source: str, fname: str, t: str | None = None,
         "Content-Disposition": f"inline; filename*=UTF-8''{quote(fname)}",
         "Cache-Control": "private, max-age=300",
     })
+
+
+@app.get("/admin/api/chunks/{source}")
+async def admin_chunks(source: str, x_admin_key: str | None = Header(default=None)):
+    """列出该来源机未 commit 的分片暂存（可合并预览）。"""
+    admin_auth(x_admin_key)
+    source = Path(source).name
+    return {"ok": True, "source": source, "uploads": _list_pending_uploads(source)}
+
+
+@app.get("/admin/api/chunks/{source}/{upload_id}/preview-token")
+async def admin_chunk_preview_token(source: str, upload_id: str, fname: str = "",
+                                    ttl: int = PREVIEW_TTL_DEFAULT,
+                                    x_admin_key: str | None = Header(default=None)):
+    admin_auth(x_admin_key)
+    source = Path(source).name
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(400, "bad upload_id")
+    d = DATA_DIR / "_tmp" / source / upload_id
+    if not d.is_dir():
+        raise HTTPException(404, "not found")
+    meta = _read_chunk_meta(d)
+    name = Path(fname or meta.get("fname") or "").name
+    if not name or not is_previewable(name):
+        raise HTTPException(415, "not previewable")
+    token, exp = make_preview_token(source, upload_id, ttl)
+    return {"ok": True, "token": token, "expires_at": exp,
+            "media_type": preview_media_type(name),
+            "url": f"/archive/preview_chunks/{quote(source)}/{quote(upload_id)}"
+                   f"?fname={quote(name)}&t={token}"}
+
+
+@app.get("/archive/preview_chunks/{source}/{upload_id}")
+async def archive_preview_chunks(source: str, upload_id: str, fname: str = "",
+                                 t: str | None = None, k: str | None = None,
+                                 x_archive_key: str | None = Header(default=None),
+                                 x_admin_key: str | None = Header(default=None)):
+    """把未 commit 的分片按序合并后在线预览；缓存 24h 未再预览自动清理。"""
+    source = Path(source).name
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(400, "bad upload_id")
+    cfg = load_config()
+    authed = bool(t and valid_preview_token(source, upload_id, t))
+    if not authed and ((k and k == cfg.get("admin_key"))
+                       or (x_admin_key and x_admin_key == cfg.get("admin_key"))):
+        authed = True
+    if not authed and x_archive_key:
+        src = get_source(x_archive_key)
+        if src.get("name") != source:
+            raise HTTPException(403, "source mismatch")
+        authed = True
+    if not authed:
+        raise HTTPException(401, "preview auth required")
+
+    d = DATA_DIR / "_tmp" / source / upload_id
+    meta = _read_chunk_meta(d)
+    name = Path(fname or meta.get("fname") or f"upload_{upload_id}.bin").name
+    if not is_previewable(name):
+        raise HTTPException(415, "not previewable")
+
+    target, _meta_fname, nparts = await asyncio.to_thread(_merge_chunks, source, upload_id)
+    await asyncio.to_thread(cleanup_preview_cache)
+    return FileResponse(target, media_type=preview_media_type(name), headers={
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}",
+        "Cache-Control": "private, max-age=60",
+        "X-Chunk-Count": str(nparts),
+    })
+
+
+async def _preview_cleanup_loop():
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_preview_cache, PREVIEW_CACHE_TTL, True)
+        except Exception:
+            pass
+        await asyncio.sleep(1800)
+
+
+@app.on_event("startup")
+async def _start_preview_cleanup():
+    asyncio.create_task(_preview_cleanup_loop())
 
 
 async def _delete_one(source: str, fname: str) -> bool:
@@ -876,6 +1119,8 @@ th,td{padding:5px 5px}.hide-m{display:none}}
       <span id="fileMsg" class="msg tiny"></span></div>
     <div id="fileBox"></div>
     <div class="pager" id="pager"></div></div>
+  <div class="card"><h2>未完成分片 <span class="tiny">（可合并预览；超过 24h 未再预览的合并缓存自动清理）</span></h2>
+    <div id="chunkBox" class="tiny">加载中…</div></div>
   </div>
 
   <div class="view" id="view-audit">
@@ -947,6 +1192,7 @@ async function preview(src,fname){
     const mt=(r.media_type||'').split(';')[0].trim();
     q('#pvTitle').textContent=fname;
     const dl=q('#pvDownload');
+    dl.style.display='';
     dl.href=`/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(fname)}/dl?t=${encodeURIComponent(r.token)}`;
     dl.setAttribute('download',fname);
     const box=q('#pvBody');box.innerHTML='';
@@ -965,6 +1211,40 @@ async function preview(src,fname){
   }catch(e){alert('预览失败: '+e.message);}
 }
 function closePreview(){q('#pvMask').classList.remove('on');q('#pvBody').innerHTML='';}
+async function previewChunk(src,uploadId,fname){
+  try{
+    const r=await api(`/admin/api/chunks/${encodeURIComponent(src)}/${encodeURIComponent(uploadId)}/preview-token${fname?'?fname='+encodeURIComponent(fname):''}`);
+    const mt=(r.media_type||'').split(';')[0].trim();
+    q('#pvTitle').textContent=`${fname||uploadId}（分片合并预览）`;
+    q('#pvDownload').style.display='none';
+    const box=q('#pvBody');box.innerHTML='';
+    let el;
+    if(mt.startsWith('image/')){el=document.createElement('img');el.src=r.url;el.alt=fname;}
+    else if(mt.startsWith('video/')){el=document.createElement('video');el.src=r.url;
+      el.controls=true;el.autoplay=true;el.playsInline=true;}
+    else if(mt.startsWith('audio/')){el=document.createElement('audio');el.src=r.url;
+      el.controls=true;el.autoplay=true;}
+    else if(mt==='application/pdf'){el=document.createElement('iframe');el.src=r.url;}
+    else{el=document.createElement('pre');el.textContent='合并中…';
+      fetch(r.url).then(x=>x.text()).then(t=>{el.textContent=t;})
+        .catch(e=>{el.textContent='加载失败: '+e;});}
+    box.appendChild(el);
+    q('#pvMask').classList.add('on');
+  }catch(e){alert('分片预览失败: '+e.message);}
+}
+async function loadChunks(src){
+  const box=q('#chunkBox');
+  try{
+    const r=await api(`/admin/api/chunks/${encodeURIComponent(src)}`);
+    const us=r.uploads||[];
+    box.innerHTML=`<table><tr><th>文件名</th><th>分片</th><th>已收大小</th><th class="hide-m">最近更新</th><th>upload_id</th><th>操作</th></tr>
+      ${us.map(u=>`<tr><td class="mono">${esc(u.fname||'（未知）')}</td><td>${u.parts}</td>
+        <td>${fmtB(u.size)}</td><td class="hide-m">${fmtT(u.updated_at)}</td>
+        <td class="mono tiny">${esc(u.upload_id)}</td>
+        <td>${u.previewable?`<button class="btn" data-act="cpv" data-src="${esc(src)}" data-uid="${esc(u.upload_id)}" data-fname="${esc(u.fname)}">合并预览</button>`:'<span class="tiny">不可预览</span>'}</td></tr>`).join('')
+      ||'<tr><td colspan="6" class="tiny">暂无未完成分片</td></tr>'}</table>`;
+  }catch(e){box.innerHTML=`<span style="color:var(--bad)">加载失败: ${esc(e.message)}</span>`;}
+}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closePreview();});
 async function doLogin(){
   AK=q('#loginKey').value.trim();
@@ -1029,7 +1309,8 @@ async function saveSrc(){
 let curPage=1;
 async function loadFiles(p){
   curPage=p||1;const src=q('#srcSel').value;
-  if(!src){q('#fileBox').innerHTML='<div class="tiny">无来源机</div>';q('#pager').innerHTML='';return;}
+  if(!src){q('#fileBox').innerHTML='<div class="tiny">无来源机</div>';q('#pager').innerHTML='';q('#chunkBox').innerHTML='';return;}
+  loadChunks(src).catch(()=>{});
   const r=await api(`/admin/api/files/${encodeURIComponent(src)}?page=${curPage}&page_size=50`);
   q('#fileBox').innerHTML=`<table><tr><th>文件名</th><th>大小</th><th class="hide-m">归档时间</th><th class="hide-m">任务</th><th>操作</th></tr>
     ${r.files.map(f=>`<tr><td class="mono" title="${esc(f.sha256)}">${esc(f.fname)}</td>
@@ -1097,6 +1378,7 @@ document.addEventListener('click',e=>{
   const b=e.target.closest&&e.target.closest('[data-act]');if(!b)return;
   const src=b.dataset.src,fname=b.dataset.fname;
   if(b.dataset.act==='preview')preview(src,fname);
+  else if(b.dataset.act==='cpv')previewChunk(src,b.dataset.uid,fname);
   else if(b.dataset.act==='dl')downloadFile(src,fname);
   else if(b.dataset.act==='del')delFile(src,fname);
 });

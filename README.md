@@ -69,6 +69,9 @@ python3 chunk_sender.py fetch big.mp4 --dest ./restore/
 | `GET /archive/preview/{source}/{fname}` | 临时token / admin key / X-Archive-Key | 在线预览（inline，支持 Range 拖动） |
 | `GET /archive/list/{source}` / `/archive/stats` | X-Archive-Key | 清单 / 占用 |
 | `GET /admin/api/file/{source}/{fname}/preview-token` | X-Admin-Key | 生成短期预览/下载 token（默认 600s） |
+| `GET /admin/api/chunks/{source}` | X-Admin-Key | 列出未 commit 的分片暂存（可合并预览） |
+| `GET /admin/api/chunks/{source}/{upload_id}/preview-token` | X-Admin-Key | 为分片合并预览生成短期 token |
+| `GET /archive/preview_chunks/{source}/{upload_id}?fname=&t=` | 临时token / admin key / X-Archive-Key | 按序合并未完成分片并在线预览（inline，支持 Range） |
 
 ## 特性
 
@@ -78,3 +81,4 @@ python3 chunk_sender.py fetch big.mp4 --dest ./restore/
 - 管理台删除功能（单文件/清空来源机）带确认；删除后来源机回源失效
 - 操作审计：写操作按操作者（来源机 key / admin）留痕入 archive.db `audit_log` 表，读操作（列表/浏览）不留痕避免噪音；审计写入失败不影响业务
 - 在线预览：图片/视频/音频/PDF/文本可在管理台直接预览；视频支持 Range 拖动；媒体 URL 使用绑定 source+fname 的短期签名 token，不暴露 admin key；SVG/HTML 不内联，防同源脚本注入
+- 分片合并预览：未 commit 的分片暂存在管理台「文件管理」下方可见，可按序合并后直接预览（支持 Range）；合并缓存放 `data/_preview/`，24h 内未再次预览自动清理，commit 成功后立即清理对应缓存

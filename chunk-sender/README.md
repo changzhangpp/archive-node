@@ -56,6 +56,7 @@ graph LR
 - **安全覆盖**：目标已存在且校验一致时跳过；不一致需显式 `--overwrite`。
 - **续传**：下载中断留下的 `<dest>.part` 在下次 `fetch` 时自动续传，完成后整体复校。
 - **回源留痕**：归档机对每次取回记 `audit_log`（action=fetch）。
+- **在线预览**：归档机提供 `GET /archive/preview/{source}/{fname}`（inline、支持 Range），管理台「文件管理」内置预览；程序侧可用来源机 key 访问，浏览器请用管理台或短期 token。
 
 ## 快速开始
 

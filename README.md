@@ -26,7 +26,7 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 | 区块 | 说明 |
 |------|------|
 | 资源管理 | 磁盘总量/剩余、归档总量、各来源机占用与配额使用条、最近推送时间 |
-| 文件管理 | 按来源机浏览（分页）、下载、删除单个、清空某来源机（删除有确认） |
+| 文件管理 | 按来源机浏览（分页）、在线预览（图片/视频/音频/PDF/文本）、下载、删除单个、清空某来源机（删除有确认） |
 | 来源机关联配置 | 增删改来源机（名称/key/配额），保存写回 config.json 立即生效；可改 admin_key |
 | 操作日志 | 按 key 来源记录文件级操作（新增/覆盖/回源拉取/下载/删除/清空/上传/编辑/重命名/移动/复制/解压/终止进程/配置修改），保留期 config.json `audit_retention_days`（默认 30 天），支持按操作者/动作/关键词筛选、分页、导出 CSV、一键清空（清空动作本身留痕） |
 
@@ -66,7 +66,9 @@ python3 chunk_sender.py fetch big.mp4 --dest ./restore/
 | `POST /archive/push_commit?fname=&upload_id=&size=&sha256=[&mtime=&task_id=]` | X-Archive-Key | 拼装分片、整体校验、落盘记账 |
 | `GET /archive/whoami` | X-Archive-Key | 按 key 返回登记名 |
 | `GET /archive/file/{source}/{fname}` | X-Archive-Key | 回源拉取 |
+| `GET /archive/preview/{source}/{fname}` | 临时token / admin key / X-Archive-Key | 在线预览（inline，支持 Range 拖动） |
 | `GET /archive/list/{source}` / `/archive/stats` | X-Archive-Key | 清单 / 占用 |
+| `GET /admin/api/file/{source}/{fname}/preview-token` | X-Admin-Key | 生成短期预览/下载 token（默认 600s） |
 
 ## 特性
 
@@ -75,3 +77,4 @@ python3 chunk_sender.py fetch big.mp4 --dest ./restore/
 - 清单记 SQLite（archive.db），文件落 `data/{来源机名}/`
 - 管理台删除功能（单文件/清空来源机）带确认；删除后来源机回源失效
 - 操作审计：写操作按操作者（来源机 key / admin）留痕入 archive.db `audit_log` 表，读操作（列表/浏览）不留痕避免噪音；审计写入失败不影响业务
+- 在线预览：图片/视频/音频/PDF/文本可在管理台直接预览；视频支持 Range 拖动；媒体 URL 使用绑定 source+fname 的短期签名 token，不暴露 admin key；SVG/HTML 不内联，防同源脚本注入

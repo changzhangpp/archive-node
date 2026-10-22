@@ -5,6 +5,7 @@
   GET  /archive/whoami                  按 key 返回登记名
   POST /archive/push                    推送归档（query: fname,sha256,size[,mtime,task_id,source]）
   GET  /archive/file/{source}/{fname}   回源拉取
+  GET  /archive/preview/{source}/{fname} 在线预览（inline，Range；key/admin/临时token）
   GET  /archive/list/{source}           清单
   GET  /archive/stats                   占用统计
 
@@ -12,7 +13,8 @@
   GET  /admin                           管理页面（资源管理/文件管理/来源机配置）
   GET  /admin/api/overview              磁盘与各来源机占用统计
   GET  /admin/api/files/{source}        文件清单（分页）
-  GET  /admin/api/file/{source}/{fname}/dl   下载文件
+  GET  /admin/api/file/{source}/{fname}/dl   下载文件（可带临时 token）
+  GET  /admin/api/file/{source}/{fname}/preview-token  生成预览/下载临时 token
   POST /admin/api/file/{source}/{fname}/delete  删除文件（磁盘+清单）
   POST /admin/api/sources               保存来源机配置（写回 config.json）
 
@@ -22,8 +24,10 @@ config.json：listen_port / admin_key / sources[{name,key,quota_mb}]（quota_mb=
 import asyncio
 import csv
 import hashlib
+import hmac
 import io
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -31,6 +35,7 @@ import shutil
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -40,7 +45,7 @@ DATA_DIR = BASE / "data"
 DB_PATH = BASE / "archive.db"
 CONFIG_PATH = BASE / "config.json"
 WEB_DIR = BASE / "web"
-VERSION = "20260930h"
+VERSION = "20261021a"
 START_TS = time.time()
 
 DEFAULT_CONFIG = {
@@ -82,6 +87,69 @@ def get_source(key: str | None) -> dict:
 def admin_auth(key: str | None) -> None:
     if not key or key != load_config().get("admin_key"):
         raise HTTPException(401, "invalid admin key")
+
+
+# ==================== 在线预览 ====================
+PREVIEW_TTL_DEFAULT = 600
+PREVIEW_TTL_MAX = 3600
+PREVIEW_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".avif": "image/avif",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8",
+    ".md": "text/plain; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+}
+
+
+def preview_media_type(fname: str) -> str | None:
+    ext = Path(fname).suffix.lower()
+    if ext in PREVIEW_MIME:
+        return PREVIEW_MIME[ext]
+    mt, _ = mimetypes.guess_type(fname)
+    return mt
+
+
+def is_previewable(fname: str) -> bool:
+    mt = preview_media_type(fname)
+    if not mt:
+        return False
+    base = mt.split(";")[0].strip()
+    if base in ("text/html", "image/svg+xml"):
+        return False  # 防同源脚本注入
+    return (base.startswith(("image/", "video/", "audio/", "text/"))
+            or base in ("application/pdf", "application/json", "application/xml"))
+
+
+def _preview_sign(source: str, fname: str, exp: int) -> str:
+    secret = str(load_config().get("admin_key", "")).encode()
+    msg = f"{source}\n{fname}\n{int(exp)}".encode()
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def make_preview_token(source: str, fname: str, ttl: int = PREVIEW_TTL_DEFAULT):
+    ttl = max(30, min(int(ttl), PREVIEW_TTL_MAX))
+    exp = int(time.time()) + ttl
+    return f"{exp}.{_preview_sign(source, fname, exp)}", exp
+
+
+def valid_preview_token(source: str, fname: str, token: str | None) -> bool:
+    try:
+        exp_s, sig = str(token).split(".", 1)
+        exp = int(exp_s)
+    except (ValueError, AttributeError):
+        return False
+    if exp < int(time.time()):
+        return False
+    return hmac.compare_digest(sig, _preview_sign(source, fname, exp))
+
 
 
 def db() -> sqlite3.Connection:
@@ -471,14 +539,66 @@ async def admin_files(source: str, page: int = 1, page_size: int = 50,
 
 
 @app.get("/admin/api/file/{source}/{fname}/dl")
-async def admin_file_dl(source: str, fname: str,
+async def admin_file_dl(source: str, fname: str, t: str | None = None,
                         x_admin_key: str | None = Header(default=None)):
-    admin_auth(x_admin_key)
-    target = DATA_DIR / Path(source).name / Path(fname).name
+    source = Path(source).name
+    fname = Path(fname).name
+    if not (t and valid_preview_token(source, fname, t)):
+        admin_auth(x_admin_key)
+    target = DATA_DIR / source / fname
     if not target.is_file():
         raise HTTPException(404, "not found")
     audit("admin", "admin", "download", f"{source}/{fname}")
-    return FileResponse(target, filename=target.name)
+    return FileResponse(target, filename=fname)
+
+
+@app.get("/admin/api/file/{source}/{fname}/preview-token")
+async def admin_preview_token(source: str, fname: str, ttl: int = PREVIEW_TTL_DEFAULT,
+                              x_admin_key: str | None = Header(default=None)):
+    """生成短期预览/下载 token（绑定 source+fname，默认 10 分钟）。"""
+    admin_auth(x_admin_key)
+    source = Path(source).name
+    fname = Path(fname).name
+    target = DATA_DIR / source / fname
+    if not target.is_file():
+        raise HTTPException(404, "not found")
+    if not is_previewable(fname):
+        raise HTTPException(415, "not previewable")
+    token, exp = make_preview_token(source, fname, ttl)
+    return {"ok": True, "token": token, "expires_at": exp,
+            "media_type": preview_media_type(fname),
+            "url": f"/archive/preview/{quote(source)}/{quote(fname)}?t={token}"}
+
+
+@app.get("/archive/preview/{source}/{fname}")
+async def archive_preview(source: str, fname: str, t: str | None = None,
+                          k: str | None = None,
+                          x_archive_key: str | None = Header(default=None),
+                          x_admin_key: str | None = Header(default=None)):
+    """在线预览（inline，支持 Range）。鉴权：临时 token / admin key / 来源机 key。"""
+    source = Path(source).name
+    fname = Path(fname).name
+    cfg = load_config()
+    authed = bool(t and valid_preview_token(source, fname, t))
+    if not authed and ((k and k == cfg.get("admin_key"))
+                       or (x_admin_key and x_admin_key == cfg.get("admin_key"))):
+        authed = True
+    if not authed and x_archive_key:
+        src = get_source(x_archive_key)
+        if src.get("name") != source:
+            raise HTTPException(403, "source mismatch")
+        authed = True
+    if not authed:
+        raise HTTPException(401, "preview auth required")
+    target = DATA_DIR / source / fname
+    if not target.is_file():
+        raise HTTPException(404, "not archived")
+    if not is_previewable(fname):
+        raise HTTPException(415, "not previewable")
+    return FileResponse(target, media_type=preview_media_type(fname), headers={
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(fname)}",
+        "Cache-Control": "private, max-age=300",
+    })
 
 
 async def _delete_one(source: str, fname: str) -> bool:
@@ -696,6 +816,20 @@ padding:8px 14px;cursor:pointer;font-size:14px}
 .navbtn.active{color:var(--tx);border-bottom-color:var(--ac)}
 .view{display:none}
 .view.active{display:block}
+#pvMask{position:fixed;inset:0;background:rgba(8,10,13,.92);display:none;z-index:20;
+align-items:center;justify-content:center;padding:20px}
+#pvMask.on{display:flex}
+#pvBox{background:var(--card);border:1px solid var(--line);border-radius:10px;
+width:min(1000px,96vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+#pvHead{display:flex;align-items:center;gap:10px;padding:10px 12px;
+border-bottom:1px solid var(--line)}
+#pvTitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pvBody{flex:1;min-height:200px;display:flex;align-items:center;justify-content:center;
+background:#0b0f13;overflow:auto;padding:8px}
+#pvBody img,#pvBody video{max-width:100%;max-height:80vh}
+#pvBody iframe{width:100%;height:78vh;border:0;background:#fff}
+#pvBody pre{width:100%;height:78vh;overflow:auto;margin:0;padding:12px;white-space:pre-wrap}
+#pvBody audio{width:min(640px,90%)}
 @media(max-width:640px){.wrap{padding:10px}table{font-size:12px}
 th,td{padding:5px 5px}.hide-m{display:none}}
 </style></head><body>
@@ -770,6 +904,15 @@ th,td{padding:5px 5px}.hide-m{display:none}}
     <div class="pager" id="audPager"></div></div>
   </div>
 </div>
+<div id="pvMask" onclick="if(event.target===this)closePreview()">
+  <div id="pvBox">
+    <div id="pvHead"><b id="pvTitle" class="mono"></b>
+      <span style="margin-left:auto"></span>
+      <a id="pvDownload" class="btn" style="text-decoration:none" download>下载</a>
+      <button class="btn" onclick="closePreview()">关闭</button></div>
+    <div id="pvBody"></div>
+  </div>
+</div>
 <script>
 let AK=localStorage.getItem('arch_ak')||'';
 const q=s=>document.querySelector(s);
@@ -785,6 +928,44 @@ async function api(path,opt={}){
   if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
   return r.json();
 }
+const PREVIEW_EXT=/\.(jpe?g|png|gif|webp|bmp|avif|mp4|webm|mov|m4v|mp3|wav|ogg|m4a|pdf|txt|log|md|json|csv|xml)$/i;
+const isPreviewable=n=>PREVIEW_EXT.test(String(n));
+async function getFileToken(src,fname){
+  return await api(`/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(fname)}/preview-token`);
+}
+async function downloadFile(src,fname){
+  try{
+    const r=await getFileToken(src,fname);
+    const a=document.createElement('a');
+    a.href=`/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(fname)}/dl?t=${encodeURIComponent(r.token)}`;
+    a.download=fname;document.body.appendChild(a);a.click();a.remove();
+  }catch(e){alert('下载失败: '+e.message);}
+}
+async function preview(src,fname){
+  try{
+    const r=await getFileToken(src,fname);
+    const mt=(r.media_type||'').split(';')[0].trim();
+    q('#pvTitle').textContent=fname;
+    const dl=q('#pvDownload');
+    dl.href=`/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(fname)}/dl?t=${encodeURIComponent(r.token)}`;
+    dl.setAttribute('download',fname);
+    const box=q('#pvBody');box.innerHTML='';
+    let el;
+    if(mt.startsWith('image/')){el=document.createElement('img');el.src=r.url;el.alt=fname;}
+    else if(mt.startsWith('video/')){el=document.createElement('video');el.src=r.url;
+      el.controls=true;el.autoplay=true;el.playsInline=true;}
+    else if(mt.startsWith('audio/')){el=document.createElement('audio');el.src=r.url;
+      el.controls=true;el.autoplay=true;}
+    else if(mt==='application/pdf'){el=document.createElement('iframe');el.src=r.url;}
+    else{el=document.createElement('pre');el.textContent='加载中…';
+      fetch(r.url).then(x=>x.text()).then(t=>{el.textContent=t;})
+        .catch(e=>{el.textContent='加载失败: '+e;});}
+    box.appendChild(el);
+    q('#pvMask').classList.add('on');
+  }catch(e){alert('预览失败: '+e.message);}
+}
+function closePreview(){q('#pvMask').classList.remove('on');q('#pvBody').innerHTML='';}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closePreview();});
 async function doLogin(){
   AK=q('#loginKey').value.trim();
   try{await api('/admin/api/overview');localStorage.setItem('arch_ak',AK);
@@ -854,8 +1035,9 @@ async function loadFiles(p){
     ${r.files.map(f=>`<tr><td class="mono" title="${esc(f.sha256)}">${esc(f.fname)}</td>
       <td>${fmtB(f.size)}</td><td class="hide-m">${fmtT(f.pushed_at)}</td>
       <td class="hide-m tiny">${esc(f.task_id||'')}</td>
-      <td><a class="btn" style="text-decoration:none" href="/admin/api/file/${encodeURIComponent(src)}/${encodeURIComponent(f.fname)}/dl" download>下载</a>
-      <button class="btn btn-danger" onclick="delFile('${esc(src)}','${esc(f.fname)}')">删除</button></td></tr>`).join('')
+      <td>${isPreviewable(f.fname)?`<button class="btn" data-act="preview" data-src="${esc(src)}" data-fname="${esc(f.fname)}">预览</button>`:''}
+      <button class="btn" data-act="dl" data-src="${esc(src)}" data-fname="${esc(f.fname)}">下载</button>
+      <button class="btn btn-danger" data-act="del" data-src="${esc(src)}" data-fname="${esc(f.fname)}">删除</button></td></tr>`).join('')
     ||'<tr><td colspan="5" class="tiny">暂无归档文件</td></tr>'}</table>`;
   const pages=Math.max(1,Math.ceil(r.total/r.page_size));
   q('#pager').innerHTML=`<span class="tiny">共 ${r.total} 个 · 第 ${r.page}/${pages} 页</span>
@@ -911,6 +1093,13 @@ q('#audQ').addEventListener('keydown',e=>{if(e.key==='Enter')loadAudit(1);});
 if(AK){api('/admin/api/overview').then(()=>boot()).catch(()=>{});
   q('#akInput').addEventListener('change',saveKey);}
 else q('#loginMask').style.display='flex';
+document.addEventListener('click',e=>{
+  const b=e.target.closest&&e.target.closest('[data-act]');if(!b)return;
+  const src=b.dataset.src,fname=b.dataset.fname;
+  if(b.dataset.act==='preview')preview(src,fname);
+  else if(b.dataset.act==='dl')downloadFile(src,fname);
+  else if(b.dataset.act==='del')delFile(src,fname);
+});
 </script></body></html>"""
 
 

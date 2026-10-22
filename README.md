@@ -40,7 +40,7 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 
 `chunk-sender/` 是独立可部署的分片组件（零第三方依赖，支持 CLI / Python 库 / HTTP 微服务 / Docker），
 用于来源机把大文件切片后推送归档，或按清单取回（回源），支持断点续传、自动重试与整体 sha256 校验。
-用法见 `chunk-sender/README.md`。
+其他系统接入方式（直接对接协议 / Python 库 / HTTP 微服务 / CLI、Docker）、来源机登记与回调语义见 `chunk-sender/README.md`。
 
 ```bash
 cd chunk-sender

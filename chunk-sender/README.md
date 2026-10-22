@@ -10,6 +10,29 @@
 - 作为 **HTTP 微服务**：`chunk_sender_service.py`，供非 Python 系统调用
 - 作为 **容器**：自带 `Dockerfile`
 
+## 集成方式（其他系统如何接入）
+
+本组件既可**独立部署**，也可**嵌入现有系统**。其他系统要往归档机推送数据时，按对接方技术栈选择：
+
+| 方式 | 适用场景 | 入口 | 说明 |
+|---|---|---|---|
+| 直接对接协议 | 任意语言/系统 | `POST /archive/push_chunk`、`GET /archive/push_status`、`POST /archive/push_commit` | 不依赖本组件，按协议自行实现切片与提交 |
+| Python 库 | Python 系统内嵌 | `ArchiveSender(...).send(path, task_id=..., on_progress=...)` | 进程内调用，支持进度回调 |
+| HTTP 微服务 | 非 Python 系统、跨进程/跨机器 | 独立启动 `chunk_sender_service.py`，`POST /send` | 请求体为文件字节，返回归档结果 |
+| CLI / Docker | 定时任务、脚本、容器化 | `archive-send send ./file` 或运行容器 | 适合批处理与调度集成 |
+
+接入前提：每台来源机需在归档机 `config.json` 登记一个来源机名与 key。归档机据此做**来源隔离**（key 只能访问本来源机数据，跨来源 403）与**独立配额**（`quota_mb`，0 为不限）。key 通过 `X-Archive-Key` 请求头传递，仅放环境变量，勿写入代码或仓库。
+
+### 回调与结果获取
+
+当前组件为**同步语义**，没有内置的异步回调/webhook：
+
+- **CLI**：执行结束返回退出码，`--json` 输出结果 JSON（`fname`、`sha256`、`size`、`chunks_total`、`chunks_uploaded`、`chunks_skipped`、`dedup`、`usage_bytes`）。
+- **Python 库**：`send()` 返回结果 dict；`on_progress(done, total, nbytes)` 提供分片进度回调。
+- **HTTP 微服务**：`POST /send` 在请求内完成上传并同步返回归档机的 commit 结果。
+
+因此「归档完成后通知业务系统」这类回调，需要调用方在拿到同步结果后自行处理（例如在业务侧发起通知）。若需要由归档机在归档成功后**主动回调指定 URL**（含成功/失败状态、重试与签名校验），目前未内置，可作为后续扩展需求提出。
+
 ## 分片逻辑说明
 
 归档机侧协议共 3 个接口，发送端负责"切片、补片、提交"：

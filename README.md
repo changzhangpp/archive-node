@@ -36,6 +36,17 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 2. 把归档机的**对外访问地址**（沙箱环境为平台预览域名）+ 该来源机的 **key** 发给对方
 3. 来源机（dola-pool）面板 → 设置 → 归档节点：填地址+key，测试联通 → 启用
 
+## 分片发送组件（chunk-sender）
+
+`chunk-sender/` 是独立可部署的分片发送组件（零第三方依赖，支持 CLI / Python 库 / HTTP 微服务 / Docker），
+用于来源机把大文件切片后推送归档，支持断点续传、自动重试与整体 sha256 校验。用法见 `chunk-sender/README.md`。
+
+```bash
+cd chunk-sender
+ARCHIVE_URL=https://8100-572cc49902f2ee46.monkeycode-ai.live ARCHIVE_KEY=<来源机key> \
+  python3 chunk_sender.py send ./big.mp4 --task-id job-1
+```
+
 ## 协议（供排障）
 
 | 端点 | 鉴权 | 说明 |
@@ -43,6 +54,9 @@ setsid nohup python3 server.py > archive.log 2>&1 < /dev/null &
 | `GET /health` | 无 | 探活，返回版本与来源机名列表 |
 | `GET /admin` | 页面内输 key | 管理台 |
 | `POST /archive/push?fname=&sha256=&size=[&mtime=&task_id=]` | X-Archive-Key | 推送归档，body 为文件原始字节 |
+| `POST /archive/push_chunk?fname=&upload_id=&seq=` | X-Archive-Key | 分片上传（每片 ≤128KB，body 为分片字节） |
+| `GET /archive/push_status?upload_id=&fname=` | X-Archive-Key | 查询已收分片序号（断点续传） |
+| `POST /archive/push_commit?fname=&upload_id=&size=&sha256=[&mtime=&task_id=]` | X-Archive-Key | 拼装分片、整体校验、落盘记账 |
 | `GET /archive/whoami` | X-Archive-Key | 按 key 返回登记名 |
 | `GET /archive/file/{source}/{fname}` | X-Archive-Key | 回源拉取 |
 | `GET /archive/list/{source}` / `/archive/stats` | X-Archive-Key | 清单 / 占用 |

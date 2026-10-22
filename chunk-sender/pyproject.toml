@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archive-chunk-sender"
+version = "1.0.0"
+description = "独立部署的分片发送组件：将文件切片后推送至 archive-node（支持断点续传）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+archive-send = "chunk_sender:main"
+
+[tool.setuptools]
+py-modules = ["chunk_sender"]
